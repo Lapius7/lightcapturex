@@ -227,8 +227,8 @@ const AUDIO: R = R::new(448.0, 112.0, 292.0, 184.0);
 const PANEL: R = R::new(448.0, 312.0, 292.0, 164.0);
 const FOOTER: R = R::new(PAD, 492.0, W - PAD * 2.0, 32.0);
 const SET_DIR: R = R::new(PAD, 62.0, W - PAD * 2.0, 116.0);
-const SET_KEY: R = R::new(PAD, 190.0, W - PAD * 2.0, 96.0);
-const SET_ACT: R = R::new(PAD, 298.0, W - PAD * 2.0, 44.0 + ROW * 3.0);
+const SET_KEY: R = R::new(PAD, 194.0, W - PAD * 2.0, 96.0);
+const SET_ACT: R = R::new(PAD, 306.0, W - PAD * 2.0, 44.0 + ROW * 3.0 + 4.0);
 const LIST: R = R::new(PAD, 96.0, W - PAD * 2.0, 392.0);
 const LROW: f32 = 56.0;
 const LVIS: usize = 7;
@@ -260,8 +260,8 @@ fn ctl_rect(c: Ctl) -> R {
         Ctl::Apps => field(AUDIO, 1, LABEL_A),
         Ctl::Mic => field(AUDIO, 2, LABEL_A),
         Ctl::Rec => R::new(PANEL.x + 16.0, PANEL.bottom() - 56.0, PANEL.w - 32.0, 40.0),
-        Ctl::Folder => R::new(FOOTER.right() - 140.0, FOOTER.y, 140.0, 32.0),
-        Ctl::Tab => R::new(176.0, 14.0, 216.0, 32.0),
+        Ctl::Folder => R::new(FOOTER.right() - 132.0, FOOTER.y, 132.0, 32.0),
+        Ctl::Tab => R::new((W - 216.0) / 2.0, 14.0, 216.0, 32.0),
         Ctl::ListRefresh => R::new(W - PAD - 96.0, 54.0, 96.0, 32.0),
         Ctl::SetDir => R::new(SET_DIR.right() - 16.0 - 96.0 - 8.0 - 96.0, SET_DIR.y + 52.0, 96.0, 32.0),
         Ctl::SetDirOpen => R::new(SET_DIR.right() - 16.0 - 96.0, SET_DIR.y + 52.0, 96.0, 32.0),
@@ -812,7 +812,7 @@ fn draw_footer(u: &Ui, p: &Painter) {
         Status::Failed(_, detail) => (detail.clone(), tok::TEXT_2),
         _ => (format!("保存先  {}", u.out_dir), tok::TEXT_3),
     };
-    p.text(&text, R::new(FOOTER.x + 4.0, FOOTER.y, FOOTER.w - 160.0, FOOTER.h), small, col);
+    p.text(&text, R::new(FOOTER.x, FOOTER.y, FOOTER.w - 160.0, FOOTER.h), small, col);
     draw_folder(u, p);
 }
 
