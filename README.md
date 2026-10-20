@@ -33,12 +33,12 @@ Recordings are saved to `Videos\LightCaptureX\LightCaptureX_YYYYMMDD_HHMMSS.mp4`
 
 ### Recording only some apps' sound
 
-Set "PC の音" (PC sound) to "選んだアプリだけ" (selected apps only), then pick apps with the button next to it. VALORANT and Discord are always listed; other apps appear once they play sound. Apps launched after recording starts are picked up automatically.
+Set "PC の音" (PC sound) to "アプリ" (apps), then click the "アプリ" row to open the app list. It shows running apps with their icons and marks the ones playing sound right now; VALORANT and Discord are listed even when they aren't running. Check the apps to record. Apps launched after recording starts are picked up automatically.
 
 ### Tips
 
 - If a game in exclusive fullscreen records as black, record the monitor instead of the window, or use borderless mode.
-- If F9 is taken by another app, the status line says so.
+- If F9 is taken by another app, the top right of the window says so.
 
 ## Command line (for testing)
 

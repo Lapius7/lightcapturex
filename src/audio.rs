@@ -48,7 +48,7 @@ pub fn list_mics() -> Vec<(String, String)> {
 }
 
 /// 実行中のプロセス（PID, 親 PID, exe 名）
-fn processes() -> Vec<(u32, u32, String)> {
+pub(crate) fn processes() -> Vec<(u32, u32, String)> {
     let mut out = Vec::new();
     unsafe {
         let Ok(snap) = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) else { return out };
@@ -65,8 +65,9 @@ fn processes() -> Vec<(u32, u32, String)> {
 }
 
 /// いま音声セッションを持っている（音を出せる状態の）アプリの exe 名
-pub fn audio_apps() -> Vec<String> {
-    let pids = || -> Result<Vec<u32>> {
+/// 既定の再生デバイスにある音声セッション（PID, 今まさに音を出しているか）
+pub fn audio_sessions() -> Vec<(u32, bool)> {
+    let get = || -> Result<Vec<(u32, bool)>> {
         let mut out = Vec::new();
         unsafe {
             let dev = enumerator()?.GetDefaultAudioEndpoint(eRender, eConsole)?;
@@ -74,13 +75,18 @@ pub fn audio_apps() -> Vec<String> {
             let list = mgr.GetSessionEnumerator()?;
             for i in 0..list.GetCount()? {
                 if let Ok(c) = list.GetSession(i).and_then(|s| s.cast::<IAudioSessionControl2>()) {
-                    out.push(c.GetProcessId().unwrap_or(0));
+                    let active = c.GetState().map(|s| s == AudioSessionStateActive).unwrap_or(false);
+                    out.push((c.GetProcessId().unwrap_or(0), active));
                 }
             }
         }
         Ok(out)
     };
-    let pids = pids().unwrap_or_default();
+    get().unwrap_or_default()
+}
+
+pub fn audio_apps() -> Vec<String> {
+    let pids: Vec<u32> = audio_sessions().into_iter().map(|s| s.0).collect();
     let mut names: Vec<String> = processes()
         .into_iter()
         .filter(|(pid, _, _)| *pid != 0 && *pid != std::process::id() && pids.contains(pid))

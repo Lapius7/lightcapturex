@@ -1,10 +1,12 @@
 #![windows_subsystem = "windows"]
 
+mod apps;
 mod audio;
 mod capture;
 mod convert;
 mod d3d;
 mod encoder;
+mod gfx;
 mod gui;
 mod recorder;
 
@@ -34,6 +36,9 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.is_empty() {
         gui::run();
+    } else if args[0] == "--render-ui" && args.len() > 1 {
+        // 画面を PNG に書き出すだけ（ウィンドウは出さない）
+        gui::render_ui(&args[1]);
     } else {
         cli(&args);
     }
