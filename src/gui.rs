@@ -177,6 +177,8 @@ struct Ui {
     bitrate: u32,
     /// つまみをドラッグしている部品
     drag: Option<Ctl>,
+    /// 数値を直接書き換えている部品と、入力中の数字
+    edit: Option<(Ctl, String)>,
     tray_on: bool,
     list: Vec<RecEntry>,
     /// 録画ファイルのサムネイル（パスごと）と、作成中のパス
@@ -633,6 +635,18 @@ fn slider_from_x(c: Ctl, x: f32) -> u32 {
     v
 }
 
+/// 数値の直接入力を確定する（空なら取り消し）
+fn commit_edit() {
+    let e = UI.with(|u| u.borrow_mut().edit.take());
+    if let Some((c, t)) = e {
+        if let Ok(v) = t.parse::<u32>() {
+            set_slider(c, v);
+            save_config();
+        }
+        invalidate_main();
+    }
+}
+
 fn set_slider(c: Ctl, v: u32) {
     let (lo, hi) = slider_range(c);
     UI.with(|u| {
@@ -674,7 +688,16 @@ fn draw_slider(u: &Ui, p: &Painter, c: Ctl) {
         p.dot(kx, cy, rad + 3.0, tok::HALO);
     }
     p.dot(kx, cy, rad, if s.on { tok::TEXT } else { tok::TEXT_3 });
-    p.text(&slider_text(c, v), R::new(t.right() + 8.0, r.y, r.right() - t.right() - 8.0, r.h), Font::strong(13.0).at(Align::Right), if s.on { tok::TEXT } else { tok::TEXT_3 });
+    let vr = R::new(t.right() + 8.0, r.y, r.right() - t.right() - 8.0, r.h);
+    let editing = u.edit.as_ref().filter(|(ec, _)| *ec == c);
+    if let Some((_, buf)) = editing {
+        let unit = if c == Ctl::Fps { " fps" } else { " Mbps" };
+        let caret = if u.blink { "|" } else { " " };
+        p.fill(R::new(vr.x + 6.0, vr.y + 5.0, vr.w - 6.0, vr.h - 10.0), 6.0, tok::BG);
+        p.text(&format!("{buf}{caret}{unit}"), R::new(vr.x, vr.y, vr.w - 8.0, vr.h), Font::strong(13.0).at(Align::Right), tok::TEXT);
+    } else {
+        p.text(&slider_text(c, v), vr, Font::strong(13.0).at(Align::Right), if s.on { tok::TEXT } else { tok::TEXT_3 });
+    }
     if s.focus {
         ring(p, r, tok::R_CTRL);
     }
@@ -1455,7 +1478,7 @@ fn dropdown(ctl: Ctl, items: Vec<(Option<u16>, String)>, sel: usize) -> Option<u
     }
     pop.show(sel);
     let s = dpi as f32 / 96.0;
-    let (pw, ph) = (((a.w + pop.pane) * s).round() as i32, (pop.height() * s).round() as i32);
+    let (pw, ph) = ((a.w * s).round() as i32, (pop.height() * s).round() as i32);
     unsafe {
         let mut below = POINT { x: (a.x * s).round() as i32, y: ((a.bottom() + 4.0) * s).round() as i32 };
         let mut above = POINT { x: below.x, y: ((a.y - 4.0) * s).round() as i32 - ph };
@@ -3116,6 +3139,11 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
         }
         WM_LBUTTONDOWN => {
             let (x, y) = pt(lp, dpi());
+            // 数値の部分を押したら、その場で書き換えられる。ほかを押したら入力を確定する
+            let on_value = UI.with(|u| hit_main(&u.borrow(), x, y)).filter(|h| is_slider(h.ctl) && x >= slider_track(h.ctl).right());
+            if on_value.is_none() {
+                commit_edit();
+            }
             UI.with(|u| {
                 let mut u = u.borrow_mut();
                 let h = hit_main(&u, x, y);
@@ -3123,7 +3151,10 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
                 u.kb = false;
                 if let Some(h) = h {
                     u.focus = Some(h.ctl);
-                    if is_slider(h.ctl) {
+                    if let Some(v) = on_value {
+                        let now = if v.ctl == Ctl::Fps { u.fps } else { u.bitrate };
+                        u.edit = Some((v.ctl, now.to_string()));
+                    } else if is_slider(h.ctl) {
                         u.drag = Some(h.ctl);
                     }
                 }
@@ -3179,7 +3210,43 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
             }
             LRESULT(0)
         }
+        WM_CHAR => {
+            let ch = wp.0 as u32;
+            UI.with(|u| {
+                if let Some((_, t)) = u.borrow_mut().edit.as_mut() {
+                    if ch == 8 {
+                        t.pop();
+                    } else if (0x30..=0x39).contains(&ch) && t.len() < 3 {
+                        t.push(char::from_u32(ch).unwrap_or('0'));
+                    }
+                }
+            });
+            invalidate_main();
+            LRESULT(0)
+        }
+        WM_KEYDOWN | WM_SYSKEYDOWN
+            if UI.with(|u| u.borrow().edit.is_some()) && matches!(wp.0 as u16, 0x0D | 0x1B | 0x08 | 0x2E) =>
+        {
+            match wp.0 as u16 {
+                0x0D => commit_edit(),
+                0x1B => {
+                    UI.with(|u| u.borrow_mut().edit = None);
+                    invalidate_main();
+                }
+                0x2E => {
+                    UI.with(|u| {
+                        if let Some((_, t)) = u.borrow_mut().edit.as_mut() {
+                            t.clear();
+                        }
+                    });
+                    invalidate_main();
+                }
+                _ => {}
+            }
+            LRESULT(0)
+        }
         WM_KEYDOWN | WM_SYSKEYDOWN => {
+            commit_edit();
             if !capture_key(wp.0 as u32) && msg == WM_KEYDOWN {
                 on_key(VIRTUAL_KEY(wp.0 as u16));
             } else if !UI.with(|u| u.borrow().capturing) && msg == WM_SYSKEYDOWN {
@@ -3188,6 +3255,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
             LRESULT(0)
         }
         WM_ACTIVATEAPP if wp.0 == 0 => {
+            commit_edit();
             pop_finish(None);
             cancel_capture();
             LRESULT(0)
@@ -3519,7 +3587,7 @@ pub fn render_ui(dir: &str) {
                 p.begin(tok::BG);
                 UI.with(|u| draw_main(&u.borrow(), p));
                 if let Some((pp, a)) = &pop {
-                    let r = R::new(a.x, a.bottom() + 4.0, pp.w + pp.pane, pp.height());
+                    let r = R::new(a.x, a.bottom() + 4.0, a.w, pp.height());
                     p.fill(R::new(r.x, r.y + 4.0, r.w, r.h), tok::R_POP, tok::SHADE);
                     draw_pop(pp, p, r);
                 }
