@@ -13,6 +13,7 @@ mod recs;
 mod stats;
 mod sysmon;
 mod tray;
+mod thumb;
 mod update;
 
 use std::io::Write;
@@ -101,6 +102,7 @@ fn cli(args: &[String]) {
             _ => encoder::Codec::H264,
         },
         gpu: get("--gpu"),
+        bitrate_mbps: get("--mbps").and_then(|v| v.parse().ok()).unwrap_or(0),
         path: get("--out").unwrap_or_else(|| "capture.mp4".into()),
     };
     let secs: f64 = get("--seconds").and_then(|v| v.parse().ok()).unwrap_or(5.0);

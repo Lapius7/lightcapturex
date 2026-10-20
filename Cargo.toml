@@ -1,6 +1,6 @@
 [package]
 name = "lightcapturex"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Ultra-lightweight game recorder for Windows (WGC + Media Foundation hardware encoding)"
 license = "MIT"
@@ -34,7 +34,7 @@ features = [
     "Win32_Media_Audio",
     "Win32_Media_MediaFoundation",
     "Win32_Security",
-    "Win32_Storage_FileSystem",
+    "Win32_Storage_FileSystem", "Win32_Storage_Xps",
     "Win32_System_Com",
     "Win32_System_Com_StructuredStorage",
     "Win32_System_Console",

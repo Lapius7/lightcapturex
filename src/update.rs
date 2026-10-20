@@ -75,7 +75,7 @@ pub fn check(hwnd: HWND) {
         let body = String::from_utf8_lossy(&body);
         let tag = json_str(&body, "tag_name").unwrap_or("");
         // assets の中の exe の URL（ソースの zip などは対象外）
-        let url = body.match_indices("\"browser_download_url\"").filter_map(|(i, _)| json_str(&body[i..], "browser_download_url")).find(|u| u.ends_with(".exe"));
+        let url = body.match_indices("\"browser_download_url\"").filter_map(|(i, _)| json_str(&body[i..], "browser_download_url")).find(|u| u.ends_with("/lightcapturex.exe"));
         match url {
             Some(u) if !tag.is_empty() && parse(tag) > parse(VERSION) => {
                 if let Ok(mut g) = URL.lock() {

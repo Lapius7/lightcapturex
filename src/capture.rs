@@ -123,7 +123,7 @@ impl Capture {
         let pool = Direct3D11CaptureFramePool::CreateFreeThreaded(
             &d3d,
             DirectXPixelFormat::B8G8R8A8UIntNormalized,
-            2,
+            4,
             size,
         )?;
         let session = pool.CreateCaptureSession(&item)?;
@@ -162,7 +162,7 @@ impl Capture {
             && (content.Width != self.pool_size.Width || content.Height != self.pool_size.Height)
         {
             self.pool_size = content;
-            let _ = self.pool.Recreate(&self.d3d, DirectXPixelFormat::B8G8R8A8UIntNormalized, 2, content);
+            let _ = self.pool.Recreate(&self.d3d, DirectXPixelFormat::B8G8R8A8UIntNormalized, 4, content);
         }
         let _ = frame.Close();
         ok

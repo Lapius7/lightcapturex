@@ -18,7 +18,9 @@ Capture, color conversion, scaling and encoding all run on the GPU, so it barely
 - Global hotkey to start/stop (default **F9**, changeable in the settings tab)
 - Live stats while recording: elapsed time, file size, real fps, dropped frames, audio level meters, CPU/GPU usage
 - Recordings tab: list, play, show in folder, delete
-- Changeable save folder
+- Changeable save folder and target bitrate (auto or 6–100 Mbps)
+- Live preview of each capture target in the picker; thumbnails in the recordings list
+- Auto update: checks GitHub Releases at startup and replaces the exe in place when you click Update
 - Tray icon: closing the window hides it to the tray; the icon blinks red while recording; menu for start/stop, recent recordings and quick settings; optional notifications
 - Settings are saved automatically
 
@@ -26,6 +28,10 @@ Capture, color conversion, scaling and encoding all run on the GPU, so it barely
 
 - Windows 10 2004 or later (per-app audio requires 2004+; Windows 11 recommended)
 - A GPU with a hardware video encoder
+
+## Download
+
+Get `lightcapturex.exe` from the [latest release](https://github.com/Lapius7/lightcapturex/releases/latest) and run it. It checks for updates by itself.
 
 ## Usage
 

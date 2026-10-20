@@ -8,7 +8,7 @@ use crate::recorder::{self, Recorder, Settings};
 use crate::recs::{self, RecEntry};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use crate::{audio, d3d, log, stats, sysmon, tray, update};
+use crate::{audio, d3d, log, stats, sysmon, thumb, tray, update};
 use std::cell::RefCell;
 use std::path::PathBuf;
 use std::thread::LocalKey;
@@ -48,6 +48,7 @@ enum Ctl {
     Res,
     Codec,
     Gpu,
+    Bitrate,
     Cursor,
     Sys,
     Apps,
@@ -68,7 +69,7 @@ enum Ctl {
     TogUpd,
     UpdBtn,
 }
-const ORDER: [Ctl; 22] = [
+const ORDER: [Ctl; 23] = [
     Ctl::Tab,
     Ctl::Source,
     Ctl::Quality,
@@ -76,6 +77,7 @@ const ORDER: [Ctl; 22] = [
     Ctl::Res,
     Ctl::Codec,
     Ctl::Gpu,
+    Ctl::Bitrate,
     Ctl::Cursor,
     Ctl::Sys,
     Ctl::Apps,
@@ -163,8 +165,13 @@ struct Ui {
     tray_close: bool,
     notify: bool,
     auto_update: bool,
+    /// BITRATES の何番目か（0 は自動）
+    bitrate: usize,
     tray_on: bool,
     list: Vec<RecEntry>,
+    /// 録画ファイルのサムネイル（パスごと）と、作成中のパス
+    thumbs: Vec<(String, IWICBitmap)>,
+    thumb_busy: Vec<String>,
     list_off: usize,
     // 録画中の数値
     fps_now: f32,
@@ -210,21 +217,23 @@ thread_local! {
 // ---- 配置（DIP）----
 
 const W: f32 = 760.0;
-const H: f32 = 492.0;
+const H: f32 = 536.0;
 const PAD: f32 = 20.0;
 const HEAD: f32 = 44.0;
 const ROW: f32 = 44.0;
 const SOURCE: R = R::new(PAD, 56.0, W - PAD * 2.0, 40.0);
-const VIDEO: R = R::new(PAD, 112.0, 412.0, 320.0);
+const VIDEO: R = R::new(PAD, 112.0, 412.0, 364.0);
 const AUDIO: R = R::new(448.0, 112.0, 292.0, 184.0);
-const PANEL: R = R::new(448.0, 312.0, 292.0, 120.0);
-const FOOTER: R = R::new(PAD, 448.0, W - PAD * 2.0, 32.0);
+const PANEL: R = R::new(448.0, 312.0, 292.0, 164.0);
+const FOOTER: R = R::new(PAD, 492.0, W - PAD * 2.0, 32.0);
 const SET_DIR: R = R::new(PAD, 62.0, W - PAD * 2.0, 116.0);
 const SET_KEY: R = R::new(PAD, 190.0, W - PAD * 2.0, 96.0);
 const SET_ACT: R = R::new(PAD, 298.0, W - PAD * 2.0, 44.0 + ROW * 3.0);
-const LIST: R = R::new(PAD, 96.0, W - PAD * 2.0, 344.0);
+const LIST: R = R::new(PAD, 96.0, W - PAD * 2.0, 392.0);
 const LROW: f32 = 56.0;
-const LVIS: usize = 6;
+const LVIS: usize = 7;
+/// ビットレート（Mbps）。0 は画質から自動で決める
+const BITRATES: [u32; 9] = [0, 6, 10, 16, 24, 35, 50, 80, 100];
 const LABEL_V: f32 = 112.0;
 const LABEL_A: f32 = 72.0;
 
@@ -245,7 +254,8 @@ fn ctl_rect(c: Ctl) -> R {
         Ctl::Res => field(VIDEO, 2, LABEL_V),
         Ctl::Codec => field(VIDEO, 3, LABEL_V),
         Ctl::Gpu => field(VIDEO, 4, LABEL_V),
-        Ctl::Cursor => field(VIDEO, 5, LABEL_V),
+        Ctl::Bitrate => field(VIDEO, 5, LABEL_V),
+        Ctl::Cursor => field(VIDEO, 6, LABEL_V),
         Ctl::Sys => field(AUDIO, 0, LABEL_A),
         Ctl::Apps => field(AUDIO, 1, LABEL_A),
         Ctl::Mic => field(AUDIO, 2, LABEL_A),
@@ -269,7 +279,7 @@ fn ctl_rect(c: Ctl) -> R {
 /// 押せる範囲（高さ 40 以上。カーソルの行は見出しごと押せる）
 fn hit_rect(c: Ctl) -> R {
     match c {
-        Ctl::Cursor => row(VIDEO, 5).inset(8.0, 2.0),
+        Ctl::Cursor => row(VIDEO, 6).inset(8.0, 2.0),
         Ctl::Source | Ctl::Rec | Ctl::TogTray | Ctl::TogNotify | Ctl::TogUpd => ctl_rect(c),
         _ => ctl_rect(c).inset(0.0, -4.0),
     }
@@ -562,6 +572,13 @@ fn draw_source(u: &Ui, p: &Painter) {
     p.text(display_name(&info.name), R::new(x, r.y, r.right() - x, r.h), Font::strong(13.0), fg);
 }
 
+fn bitrate_text(i: usize) -> String {
+    match BITRATES[i.min(BITRATES.len() - 1)] {
+        0 => "自動（画質に合わせる）".to_string(),
+        m => format!("{m} Mbps"),
+    }
+}
+
 fn draw_text_select(u: &Ui, p: &Painter, c: Ctl, text: &str) {
     let (r, s) = select_base(u, p, c);
     p.text(text, r, Font::text(13.0), if s.on { tok::TEXT } else { tok::TEXT_3 });
@@ -761,7 +778,7 @@ fn draw_rec_tab(u: &Ui, p: &Painter) {
     // 映像
     card(p, VIDEO, Some("映像"));
     let on = enabled(u, Ctl::Quality);
-    for (i, s) in ["画質", "フレームレート", "解像度", "コーデック", "GPU", "カーソル"].iter().enumerate() {
+    for (i, s) in ["画質", "フレームレート", "解像度", "コーデック", "GPU", "ビットレート", "カーソル"].iter().enumerate() {
         label(p, VIDEO, i, LABEL_V, s, on);
     }
     for c in [Ctl::Quality, Ctl::Fps, Ctl::Res, Ctl::Codec] {
@@ -769,6 +786,7 @@ fn draw_rec_tab(u: &Ui, p: &Painter) {
     }
     let gpu = if u.gpu == 0 { "自動".to_string() } else { u.gpus.get(u.gpu - 1).cloned().unwrap_or_default() };
     draw_text_select(u, p, Ctl::Gpu, &gpu);
+    draw_text_select(u, p, Ctl::Bitrate, &bitrate_text(u.bitrate));
     draw_toggle(u, p);
 
     // 音声
@@ -1051,12 +1069,20 @@ fn draw_list(u: &Ui, p: &Painter) {
         } else if i + 1 < shown {
             p.line(rr.x + 16.0, rr.bottom(), rr.right() - 16.0, rr.bottom(), tok::HAIR, 1.0);
         }
-        let ic = R::new(rr.x + 16.0, rr.y + 14.0, 28.0, 28.0);
-        p.fill(ic, tok::R_CTRL, if row_hot { tok::SEG_ON } else { tok::CTRL });
-        p.glyph(glyph::VIDEO, ic, 14.0, tok::TEXT_2);
-        let nw = list_btn_rect(i, 0).x - (rr.x + 56.0) - 8.0;
+        let ic = R::new(rr.x + 16.0, rr.y + 8.0, 72.0, 40.0);
+        match u.thumbs.iter().find(|t| Path::new(&t.0) == e.path) {
+            Some((_, b)) => {
+                p.image(&format!("th:{}", e.path.display()), b, ic);
+                p.stroke(ic, 6.0, tok::ICON_EDGE, 1.0);
+            }
+            None => {
+                p.fill(ic, 6.0, if row_hot { tok::SEG_ON } else { tok::CTRL });
+                p.glyph(glyph::VIDEO, ic, 14.0, tok::TEXT_2);
+            }
+        }
+        let nw = list_btn_rect(i, 0).x - (rr.x + 104.0) - 8.0;
         let nf = Font::strong(13.0);
-        p.text(&fit(p, &e.name, nf, nw), R::new(rr.x + 56.0, rr.y + 9.0, nw, 20.0), nf, tok::TEXT);
+        p.text(&fit(p, &e.name, nf, nw), R::new(rr.x + 104.0, rr.y + 9.0, nw, 20.0), nf, tok::TEXT);
         let (y, mo, d, h, mi) = e.when;
         let mut meta = Vec::new();
         if y != 0 {
@@ -1066,7 +1092,7 @@ fn draw_list(u: &Ui, p: &Painter) {
             meta.push(recs::fmt_dur(s));
         }
         meta.push(recs::fmt_size(e.size));
-        p.text(&meta.join("  ·  "), R::new(rr.x + 56.0, rr.y + 30.0, nw, 16.0), Font::text(11.5), tok::TEXT_3);
+        p.text(&meta.join("  ·  "), R::new(rr.x + 104.0, rr.y + 30.0, nw, 16.0), Font::text(11.5), tok::TEXT_3);
         for (k, g) in [glyph::PLAY, glyph::FOLDER, glyph::DELETE].into_iter().enumerate() {
             let ctl = [Ctl::ListOpen, Ctl::ListShow, Ctl::ListDel][k];
             let br = list_btn_rect(i, k);
@@ -1096,6 +1122,8 @@ fn draw_list(u: &Ui, p: &Painter) {
 // ---- 一覧（ドロップダウン）----
 
 const ITEM: f32 = 34.0;
+const PANE_W: f32 = 264.0;
+const PREV_H: f32 = 212.0;
 const VIS: usize = 8;
 
 struct Pop {
@@ -1107,14 +1135,35 @@ struct Pop {
     hover: Option<usize>,
     top: usize,
     done: Option<Option<usize>>,
+    /// 右に出すプレビューの幅（0 なら出さない）
+    pane: f32,
+    /// 項目ごとの録画対象（プレビュー用）と、作ったサムネイル
+    prev: Vec<Source>,
+    cache: Vec<Option<Option<IWICBitmap>>>,
+}
+
+fn to_wic(t: &thumb::Thumb) -> Option<IWICBitmap> {
+    use windows::Win32::Graphics::Imaging::GUID_WICPixelFormat32bppBGR;
+    unsafe { crate::gfx::gfx().wic.CreateBitmapFromMemory(t.w, t.h, &GUID_WICPixelFormat32bppBGR, t.w * 4, &t.bgra).ok() }
 }
 
 impl Pop {
+    /// ホバー中の項目のプレビューを（まだなら）作る
+    fn ensure(&mut self) {
+        let Some(i) = self.hover.filter(|&i| i < self.prev.len()) else { return };
+        if self.cache.len() < self.prev.len() {
+            self.cache.resize(self.prev.len(), None);
+        }
+        if self.cache[i].is_none() {
+            self.cache[i] = Some(thumb::source(self.prev[i], 480, 270).and_then(|t| to_wic(&t)));
+        }
+    }
     fn vis(&self) -> usize {
         self.items.len().clamp(1, VIS)
     }
     fn height(&self) -> f32 {
-        self.vis() as f32 * ITEM + 8.0
+        let h = self.vis() as f32 * ITEM + 8.0;
+        if self.pane > 0.0 { h.max(PREV_H) } else { h }
     }
     fn index_at(&self, x: f32, y: f32) -> Option<usize> {
         if x < 0.0 || x >= self.w || y < 4.0 {
@@ -1140,7 +1189,7 @@ fn draw_pop(pp: &Pop, p: &Painter, r: R) {
     for k in 0..pp.vis().min(n) {
         let i = pp.top + k;
         let (g, text) = &pp.items[i];
-        let ir = R::new(r.x + 4.0, r.y + 4.0 + k as f32 * ITEM, r.w - 8.0 - bar, ITEM);
+        let ir = R::new(r.x + 4.0, r.y + 4.0 + k as f32 * ITEM, pp.w - 8.0 - bar, ITEM);
         if pp.hover == Some(i) {
             p.fill(ir, tok::R_POP - 4.0, tok::CTRL_HOVER);
         }
@@ -1158,7 +1207,28 @@ fn draw_pop(pp: &Pop, p: &Painter, r: R) {
         let track = r.h - 12.0;
         let th = (track * VIS as f32 / n as f32).max(20.0);
         let ty = r.y + 6.0 + (track - th) * pp.top as f32 / (n - VIS) as f32;
-        p.fill(R::new(r.right() - 8.0, ty, 3.0, th), 1.5, tok::TEXT_3);
+        p.fill(R::new(r.x + pp.w - 8.0, ty, 3.0, th), 1.5, tok::TEXT_3);
+    }
+    if pp.pane > 0.0 {
+        p.line(r.x + pp.w, r.y + 10.0, r.x + pp.w, r.bottom() - 10.0, tok::HAIR, 1.0);
+        let area = R::new(r.x + pp.w + 12.0, r.y + 12.0, pp.pane - 24.0, (pp.pane - 24.0) * 9.0 / 16.0);
+        p.fill(area, 8.0, tok::BG);
+        let img = pp.hover.and_then(|i| pp.cache.get(i)).and_then(|c| c.as_ref()).and_then(|c| c.as_ref().map(|b| (b, pp.hover.unwrap_or(0))));
+        if let Some((b, i)) = img {
+            let (mut bw, mut bh) = (0u32, 0u32);
+            unsafe { let _ = b.GetSize(&mut bw, &mut bh); }
+            let k = (area.w / bw.max(1) as f32).min(area.h / bh.max(1) as f32);
+            let (iw, ih) = (bw as f32 * k, bh as f32 * k);
+            let ir = R::new(area.x + (area.w - iw) / 2.0, area.y + (area.h - ih) / 2.0, iw, ih);
+            p.image(&format!("pv{i}"), b, ir);
+        } else {
+            let msg = if pp.hover.is_some_and(|i| i < pp.prev.len()) { "プレビューを取得できません" } else { "" };
+            p.text(msg, area, Font::text(12.0).at(Align::Center), tok::TEXT_3);
+        }
+        if let Some((_, text)) = pp.hover.and_then(|i| pp.items.get(i)) {
+            let f = Font::text(12.0);
+            p.text(&fit(p, text, f, area.w), R::new(area.x, area.bottom() + 8.0, area.w, 18.0), f, tok::TEXT_2);
+        }
     }
 }
 
@@ -1204,10 +1274,15 @@ fn pop_key(vk: VIRTUAL_KEY) {
 extern "system" fn pop_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     match msg {
         WM_PAINT => {
+            POP.with(|s| {
+                if let Some(pp) = s.borrow_mut().as_mut() {
+                    pp.ensure();
+                }
+            });
             paint(hwnd, &POP_P, tok::CTRL, |p| {
                 POP.with(|s| {
                     if let Some(pp) = s.borrow().as_ref() {
-                        draw_pop(pp, p, R::new(0.0, 0.0, pp.w, pp.height()));
+                        draw_pop(pp, p, R::new(0.0, 0.0, pp.w + pp.pane, pp.height()));
                     }
                 })
             });
@@ -1237,7 +1312,7 @@ extern "system" fn pop_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRE
             // 一覧の外を押したら閉じる
             let dpi = POP.with(|s| s.borrow().as_ref().map_or(96, |pp| pp.dpi));
             let (x, y) = pt(lp, dpi);
-            let inside = POP.with(|s| s.borrow().as_ref().is_some_and(|pp| x >= 0.0 && x < pp.w && y >= 0.0 && y < pp.height()));
+            let inside = POP.with(|s| s.borrow().as_ref().is_some_and(|pp| x >= 0.0 && x < pp.w + pp.pane && y >= 0.0 && y < pp.height()));
             if !inside {
                 pop_finish(None);
             }
@@ -1270,10 +1345,15 @@ fn dropdown(ctl: Ctl, items: Vec<(Option<u16>, String)>, sel: usize) -> Option<u
         (u.hwnd, u.dpi)
     });
     let a = ctl_rect(ctl);
-    let mut pop = Pop { hwnd: HWND::default(), dpi, w: a.w, items, sel, hover: Some(sel), top: 0, done: None };
+    let mut pop = Pop { hwnd: HWND::default(), dpi, w: a.w, items, sel, hover: Some(sel), top: 0, done: None, pane: 0.0, prev: Vec::new(), cache: Vec::new() };
+    if ctl == Ctl::Source {
+        pop.prev = UI.with(|u| u.borrow().sources.iter().map(|s| s.source).collect());
+        pop.pane = PANE_W;
+        pop.w = a.w - PANE_W;
+    }
     pop.show(sel);
     let s = dpi as f32 / 96.0;
-    let (pw, ph) = ((a.w * s).round() as i32, (pop.height() * s).round() as i32);
+    let (pw, ph) = (((a.w + pop.pane) * s).round() as i32, (pop.height() * s).round() as i32);
     unsafe {
         let mut below = POINT { x: (a.x * s).round() as i32, y: ((a.bottom() + 4.0) * s).round() as i32 };
         let mut above = POINT { x: below.x, y: ((a.y - 4.0) * s).round() as i32 - ph };
@@ -1855,7 +1935,7 @@ fn save_config() {
         let codec = u.codecs.get(u.codec).map(|c| c.label()).unwrap_or_default();
         let gpu = if u.gpu == 0 { String::new() } else { u.gpus.get(u.gpu - 1).cloned().unwrap_or_default() };
         format!(
-            "source={src}\nquality={}\nfps={}\nres={}\nmic={mic}\nsysmode={}\napps={}\ncursor={}\ncodec={codec}\ngpu={gpu}\ndir={}\nhotkey={},{}\ntray_close={}\nnotify={}\nauto_update={}\n",
+            "source={src}\nquality={}\nfps={}\nres={}\nmic={mic}\nsysmode={}\napps={}\ncursor={}\ncodec={codec}\ngpu={gpu}\ndir={}\nhotkey={},{}\ntray_close={}\nnotify={}\nauto_update={}\nbitrate={}\n",
             u.quality,
             u.fps,
             u.res,
@@ -1867,7 +1947,8 @@ fn save_config() {
             u.hotkey.1,
             u.tray_close as u8,
             u.notify as u8,
-            u.auto_update as u8
+            u.auto_update as u8,
+            u.bitrate
         )
     });
     let p = config_path();
@@ -1985,6 +2066,7 @@ fn start_recording() {
             mic: if u.mic == 0 { None } else { u.mics.get(u.mic - 1).map(|x| x.0.clone()) },
             codec: u.codecs.get(u.codec).copied().unwrap_or(Codec::H264),
             gpu: if u.gpu == 0 { None } else { u.gpus.get(u.gpu - 1).cloned() },
+        bitrate_mbps: BITRATES[u.bitrate.min(BITRATES.len() - 1)],
             path: path.to_string_lossy().into_owned(),
         })
     });
@@ -2195,6 +2277,46 @@ fn refresh_list() {
         u.free = free;
         u.list_off = u.list_off.min(u.list.len().saturating_sub(LVIS));
     });
+    request_thumbs();
+}
+
+static THUMB_DONE: std::sync::Mutex<Vec<(String, Option<thumb::Thumb>)>> = std::sync::Mutex::new(Vec::new());
+const WM_THUMB: u32 = WM_APP + 5;
+
+/// まだ無い録画のサムネイルを、別スレッドで作らせる
+fn request_thumbs() {
+    let (hwnd, todo) = UI.with(|u| {
+        let mut u = u.borrow_mut();
+        let todo: Vec<String> = u.list.iter().map(|e| e.path.to_string_lossy().into_owned()).filter(|p| !u.thumbs.iter().any(|t| &t.0 == p) && !u.thumb_busy.contains(p)).collect();
+        u.thumb_busy.extend(todo.iter().cloned());
+        (u.hwnd.0 as isize, todo)
+    });
+    if todo.is_empty() || hwnd == 0 {
+        return;
+    }
+    std::thread::spawn(move || {
+        unsafe { let _ = windows::Win32::System::Com::CoInitializeEx(None, windows::Win32::System::Com::COINIT_MULTITHREADED); }
+        for path in todo {
+            let t = thumb::file(&path, 160, 90);
+            if let Ok(mut q) = THUMB_DONE.lock() {
+                q.push((path, t));
+            }
+            unsafe { let _ = PostMessageW(Some(HWND(hwnd as *mut core::ffi::c_void)), WM_THUMB, WPARAM(0), LPARAM(0)); }
+        }
+    });
+}
+
+fn take_thumbs() {
+    let done: Vec<_> = THUMB_DONE.lock().map(|mut q| std::mem::take(&mut *q)).unwrap_or_default();
+    UI.with(|u| {
+        let mut u = u.borrow_mut();
+        for (path, t) in done {
+            u.thumb_busy.retain(|p| p != &path);
+            if let Some(b) = t.and_then(|t| to_wic(&t)) {
+                u.thumbs.push((path, b));
+            }
+        }
+    });
 }
 
 /// フォルダーを選ぶダイアログ
@@ -2384,6 +2506,13 @@ fn activate(h: Hit) {
             }
             save_and_repaint();
         }
+        Ctl::Bitrate => {
+            let (items, sel) = UI.with(|u| (BITRATES.iter().enumerate().map(|(i, _)| (None, bitrate_text(i))).collect::<Vec<_>>(), u.borrow().bitrate));
+            if let Some(i) = dropdown(Ctl::Bitrate, items, sel).filter(|_| UI.with(|u| enabled(&u.borrow(), Ctl::Bitrate))) {
+                UI.with(|u| u.borrow_mut().bitrate = i);
+            }
+            save_and_repaint();
+        }
         Ctl::Mic => {
             refresh_mics(selected_mic_id());
             let (items, sel) = UI.with(|u| {
@@ -2534,7 +2663,7 @@ fn on_key(vk: VIRTUAL_KEY) {
             let v = UI.with(|u| seg_value(&u.borrow(), c));
             let v = if vk == VK_LEFT || vk == VK_UP { v.saturating_sub(1) } else { v + 1 };
             set_value(c, v);
-        } else if matches!(c, Ctl::Source | Ctl::Gpu | Ctl::Mic) && (vk == VK_DOWN || vk == VK_UP) {
+        } else if matches!(c, Ctl::Source | Ctl::Gpu | Ctl::Mic | Ctl::Bitrate) && (vk == VK_DOWN || vk == VK_UP) {
             activate(Hit { ctl: c, idx: 0 });
         }
     } else if (vk == VK_SPACE || vk == VK_RETURN) && !is_seg(c) {
@@ -2646,6 +2775,7 @@ fn init_values() {
         u.tray_close = num("tray_close", 1) != 0;
         u.notify = num("notify", 1) != 0;
         u.auto_update = num("auto_update", 1) != 0;
+        u.bitrate = num("bitrate", 0).min(BITRATES.len() - 1);
     });
     refresh_mics(cfg(&c, "mic").filter(|s| !s.is_empty()).map(String::from));
     if !apps.is_empty() {
@@ -2951,6 +3081,11 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
             quit(hwnd);
             LRESULT(0)
         }
+        WM_THUMB => {
+            take_thumbs();
+            invalidate_main();
+            LRESULT(0)
+        }
         WM_SHOWME => {
             show_window();
             LRESULT(0)
@@ -3239,8 +3374,13 @@ pub fn render_ui(dir: &str) {
                     }
                 });
                 let a = ctl_rect(c);
-                let mut pp = Pop { hwnd: HWND::default(), dpi, w: a.w, items, sel, hover: Some(sel), top: 0, done: None };
-                pp.show(sel);
+                let mut pp = Pop { hwnd: HWND::default(), dpi, w: a.w, items, sel, hover: Some(sel), top: 0, done: None, pane: 0.0, prev: Vec::new(), cache: Vec::new() };
+                if c == Ctl::Source {
+            pp.pane = PANE_W;
+            pp.w = a.w - PANE_W;
+            pp.prev = vec![Source::Monitor(0); pp.items.len()];
+        }
+        pp.show(sel);
                 if pp.items.len() > 1 {
                     pp.hover = Some((sel + 1) % pp.items.len());
                 }
@@ -3251,7 +3391,7 @@ pub fn render_ui(dir: &str) {
                 p.begin(tok::BG);
                 UI.with(|u| draw_main(&u.borrow(), p));
                 if let Some((pp, a)) = &pop {
-                    let r = R::new(a.x, a.bottom() + 4.0, pp.w, pp.height());
+                    let r = R::new(a.x, a.bottom() + 4.0, pp.w + pp.pane, pp.height());
                     p.fill(R::new(r.x, r.y + 4.0, r.w, r.h), tok::R_POP, tok::SHADE);
                     draw_pop(pp, p, r);
                 }

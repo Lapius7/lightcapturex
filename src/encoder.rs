@@ -94,6 +94,8 @@ impl Encoder {
             let attrs = attrs.unwrap();
             attrs.SetUnknown(&MF_SINK_WRITER_D3D_MANAGER, &manager)?;
             attrs.SetUINT32(&MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS, 1)?;
+    // 書き込みを待たせない（ゲームに合わせて遅れたぶんを取り戻せるように）
+    let _ = attrs.SetUINT32(&MF_SINK_WRITER_DISABLE_THROTTLING, 1);
             attrs.SetGUID(&MF_TRANSCODE_CONTAINERTYPE, &MFTranscodeContainerType_MPEG4)?;
             let writer = MFCreateSinkWriterFromURL(&HSTRING::from(path), None, &attrs)?;
 
