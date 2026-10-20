@@ -1,8 +1,22 @@
+<div align="center">
+
 # LightCaptureX
 
-[日本語](README.ja.md)
+An ultra-lightweight game recorder for Windows.
 
-An ultra-lightweight game recorder for Windows. A single ~0.6 MB executable with no runtime dependencies.
+[![Release](https://img.shields.io/github/v/release/Lapius7/lightcapturex?style=flat-square&color=e5484d)](https://github.com/Lapius7/lightcapturex/releases/latest)
+[![License](https://img.shields.io/github/license/Lapius7/lightcapturex?style=flat-square)](LICENSE)
+![Windows](https://img.shields.io/badge/Windows-10%20%7C%2011-3b3e44?style=flat-square)
+
+**English** · [日本語](README.ja.md)
+
+<img src="docs/screenshots/idle.png" width="640" alt="Main screen">
+
+<img src="docs/screenshots/live.png" width="316" alt="Live stats while recording"> <img src="docs/screenshots/settings.png" width="316" alt="Settings">
+
+</div>
+
+A single ~0.7 MB executable with no runtime dependencies.
 
 Capture, color conversion, scaling and encoding all run on the GPU, so it barely touches the CPU — useful for CPU-bound games such as VALORANT.
 

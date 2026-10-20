@@ -1,8 +1,22 @@
+<div align="center">
+
 # LightCaptureX
 
-[English](README.md)
+Windows 用の超軽量なゲーム録画ソフト。
 
-Windows 用の超軽量なゲーム録画ソフトです。約 0.6 MB の exe ひとつで動き、ランタイムのインストールはいりません。
+[![Release](https://img.shields.io/github/v/release/Lapius7/lightcapturex?style=flat-square&color=e5484d)](https://github.com/Lapius7/lightcapturex/releases/latest)
+[![License](https://img.shields.io/github/license/Lapius7/lightcapturex?style=flat-square)](LICENSE)
+![Windows](https://img.shields.io/badge/Windows-10%20%7C%2011-3b3e44?style=flat-square)
+
+[English](README.md) · **日本語**
+
+<img src="docs/screenshots/idle.png" width="640" alt="メイン画面">
+
+<img src="docs/screenshots/live.png" width="316" alt="録画中のリアルタイム表示"> <img src="docs/screenshots/settings.png" width="316" alt="設定">
+
+</div>
+
+約 0.7 MB の exe ひとつで動き、ランタイムのインストールはいりません。
 
 画面の取り込み、色の変換、縮小、エンコードをすべて GPU で行うので、CPU はほとんど使いません。VALORANT のように CPU が重いゲームの録画に向いています。
 
