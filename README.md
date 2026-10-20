@@ -32,7 +32,7 @@ Capture, color conversion, scaling and encoding all run on the GPU, so it barely
 - Global hotkey to start/stop (default **F9**, changeable in the settings tab)
 - Live stats while recording: elapsed time, file size, real fps, dropped frames, audio level meters, CPU/GPU usage
 - Recordings tab: list, play, show in folder, delete
-- Changeable save folder and target bitrate (auto or 1–150 Mbps (slider))
+- Changeable save folder and target bitrate (auto or 500–150,000 kbps (slider or type a value))
 - Live preview of each capture target in the picker; thumbnails in the recordings list
 - Auto update: checks GitHub Releases at startup and replaces the exe in place when you click Update
 - Tray icon: closing the window hides it to the tray; the icon blinks red while recording; menu for start/stop, recent recordings and quick settings; optional notifications

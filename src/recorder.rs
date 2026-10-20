@@ -31,8 +31,8 @@ pub struct Settings {
     pub codec: Codec,
     /// 使う GPU の名前（None なら録画対象のモニターを担当する GPU を自動で選ぶ）
     pub gpu: Option<String>,
-    /// 目標ビットレート（Mbps）。0 なら画質から決める
-    pub bitrate_mbps: u32,
+    /// 目標ビットレート（kbps）。0 なら画質から決める
+    pub bitrate_kbps: u32,
     pub path: String,
 }
 
@@ -165,7 +165,7 @@ fn setup_on(s: &Settings, adapter: Option<&IDXGIAdapter1>) -> Result<Setup> {
     let (sw, sh) = cap.size();
     let (ow, oh) = output_size(sw, sh, s.max_height);
     let mut conv = Converter::new(&device, &ctx, sw, sh, ow, oh, s.fps)?;
-    let br = if s.bitrate_mbps > 0 { s.bitrate_mbps * 1_000_000 } else { bitrate(ow, oh, s.fps, s.quality, s.codec) };
+    let br = if s.bitrate_kbps > 0 { s.bitrate_kbps * 1000 } else { bitrate(ow, oh, s.fps, s.quality, s.codec) };
     let enc = Encoder::new(&s.path, &device, s.codec, ow, oh, s.fps, br, s.system_audio || s.mic.is_some())?;
     // 最初のフレームが届くまで最大 1 秒待つ（届いた時点を録画の時刻 0 とする）
     let freq = qpf();

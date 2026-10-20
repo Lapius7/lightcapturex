@@ -38,8 +38,10 @@ const QUALITIES: [&str; 4] = ["低", "中", "高", "最高"];
 const FPS_PRESETS: [u32; 5] = [30, 60, 120, 144, 240];
 const FPS_MIN: u32 = 15;
 const FPS_MAX: u32 = 360;
-/// ビットレートの上限（Mbps）。0 は「自動」
-const BR_MAX: u32 = 150;
+/// ビットレートの上限（kbps）。0 は「自動」
+const BR_MAX: u32 = 150_000;
+/// ビットレートのスライダーが刻む幅（kbps）
+const BR_STEP: u32 = 500;
 /// 旧設定（fps=番号）の番号が指していた値
 const FPS_LEGACY: [u32; 5] = [30, 60, 120, 144, 240];
 const BR_LEGACY: [u32; 9] = [0, 6, 10, 16, 24, 35, 50, 80, 100];
@@ -173,7 +175,7 @@ struct Ui {
     tray_close: bool,
     notify: bool,
     auto_update: bool,
-    /// 目標ビットレート（Mbps）。0 は自動
+    /// 目標ビットレート（kbps）。0 は自動
     bitrate: u32,
     /// つまみをドラッグしている部品
     drag: Option<Ctl>,
@@ -244,7 +246,7 @@ const SET_ACT: R = R::new(PAD, 306.0, W - PAD * 2.0, 44.0 + ROW * 3.0 + 4.0);
 const LIST: R = R::new(PAD, 96.0, W - PAD * 2.0, 392.0);
 const LROW: f32 = 56.0;
 const LVIS: usize = 7;
-/// ビットレート（Mbps）。0 は画質から自動で決める
+/// ビットレート（kbps）。0 は画質から自動で決める
 const LABEL_V: f32 = 112.0;
 const LABEL_A: f32 = 72.0;
 
@@ -581,10 +583,10 @@ fn draw_source(u: &Ui, p: &Painter) {
     p.text(display_name(&info.name), R::new(x, r.y, r.right() - x, r.h), Font::strong(13.0), fg);
 }
 
-fn bitrate_text(m: u32) -> String {
-    match m {
+fn bitrate_text(k: u32) -> String {
+    match k {
         0 => "自動".to_string(),
-        m => format!("{m} Mbps"),
+        k => format!("{k} kbps"),
     }
 }
 
@@ -627,6 +629,9 @@ fn slider_from_x(c: Ctl, x: f32) -> u32 {
     let k = 7.0;
     let f = ((x - (t.x + k)) / (t.w - 2.0 * k)).clamp(0.0, 1.0);
     let v = lo + (f * (hi - lo) as f32).round() as u32;
+    if c == Ctl::Bitrate {
+        return (v + BR_STEP / 2) / BR_STEP * BR_STEP;
+    }
     if c == Ctl::Fps {
         if let Some(&p) = FPS_PRESETS.iter().find(|&&p| p.abs_diff(v) <= 3) {
             return p;
@@ -691,7 +696,7 @@ fn draw_slider(u: &Ui, p: &Painter, c: Ctl) {
     let vr = R::new(t.right() + 8.0, r.y, r.right() - t.right() - 8.0, r.h);
     let editing = u.edit.as_ref().filter(|(ec, _)| *ec == c);
     if let Some((_, buf)) = editing {
-        let unit = if c == Ctl::Fps { " fps" } else { " Mbps" };
+        let unit = if c == Ctl::Fps { " fps" } else { " kbps" };
         let caret = if u.blink { "|" } else { " " };
         p.fill(R::new(vr.x + 6.0, vr.y + 5.0, vr.w - 6.0, vr.h - 10.0), 6.0, tok::BG);
         p.text(&format!("{buf}{caret}{unit}"), R::new(vr.x, vr.y, vr.w - 8.0, vr.h), Font::strong(13.0).at(Align::Right), tok::TEXT);
@@ -2060,7 +2065,7 @@ fn save_config() {
         let codec = u.codecs.get(u.codec).map(|c| c.label()).unwrap_or_default();
         let gpu = if u.gpu == 0 { String::new() } else { u.gpus.get(u.gpu - 1).cloned().unwrap_or_default() };
         format!(
-            "source={src}\nquality={}\nfps={}\nres={}\nmic={mic}\nsysmode={}\napps={}\ncursor={}\ncodec={codec}\ngpu={gpu}\ndir={}\nhotkey={},{}\ntray_close={}\nnotify={}\nauto_update={}\nbitrate={}\n",
+            "source={src}\nquality={}\nfps={}\nres={}\nmic={mic}\nsysmode={}\napps={}\ncursor={}\ncodec={codec}\ngpu={gpu}\ndir={}\nhotkey={},{}\ntray_close={}\nnotify={}\nauto_update={}\nbitrate_kbps={}\n",
             u.quality,
             u.fps,
             u.res,
@@ -2191,7 +2196,7 @@ fn start_recording() {
             mic: if u.mic == 0 { None } else { u.mics.get(u.mic - 1).map(|x| x.0.clone()) },
             codec: u.codecs.get(u.codec).copied().unwrap_or(Codec::H264),
             gpu: if u.gpu == 0 { None } else { u.gpus.get(u.gpu - 1).cloned() },
-        bitrate_mbps: u.bitrate.min(BR_MAX),
+        bitrate_kbps: u.bitrate.min(BR_MAX),
             path: path.to_string_lossy().into_owned(),
         })
     });
@@ -2778,7 +2783,13 @@ fn on_key(vk: VIRTUAL_KEY) {
     if vk == VK_LEFT || vk == VK_RIGHT || vk == VK_UP || vk == VK_DOWN {
         if is_slider(c) {
             let v = UI.with(|u| slider_value(&u.borrow(), c));
-            let step = if vk == VK_UP || vk == VK_DOWN { 10 } else { 1 };
+            let big = vk == VK_UP || vk == VK_DOWN;
+            let step = match (c, big) {
+                (Ctl::Bitrate, true) => 5000,
+                (Ctl::Bitrate, false) => BR_STEP,
+                (_, true) => 10,
+                _ => 1,
+            };
             let v = if vk == VK_LEFT || vk == VK_DOWN { v.saturating_sub(step) } else { v + step };
             set_slider(c, v);
             save_config();
@@ -2898,7 +2909,12 @@ fn init_values() {
         u.tray_close = num("tray_close", 1) != 0;
         u.notify = num("notify", 1) != 0;
         u.auto_update = num("auto_update", 1) != 0;
-        u.bitrate = cfg(&c, "bitrate").and_then(|v| v.parse::<u32>().ok()).map(|v| if v < 9 { BR_LEGACY[v as usize] } else { v }).unwrap_or(0).min(BR_MAX);
+        // 旧版は Mbps（さらに古い版は段階の番号）で `bitrate` に保存していた
+        u.bitrate = cfg(&c, "bitrate_kbps")
+            .and_then(|v| v.parse::<u32>().ok())
+            .or_else(|| cfg(&c, "bitrate").and_then(|v| v.parse::<u32>().ok()).map(|v| if v < 9 { BR_LEGACY[v as usize] } else { v }.saturating_mul(1000)))
+            .unwrap_or(0)
+            .min(BR_MAX);
     });
     refresh_mics(cfg(&c, "mic").filter(|s| !s.is_empty()).map(String::from));
     if !apps.is_empty() {
@@ -3216,7 +3232,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
                 if let Some((_, t)) = u.borrow_mut().edit.as_mut() {
                     if ch == 8 {
                         t.pop();
-                    } else if (0x30..=0x39).contains(&ch) && t.len() < 3 {
+                    } else if (0x30..=0x39).contains(&ch) && t.len() < 6 {
                         t.push(char::from_u32(ch).unwrap_or('0'));
                     }
                 }
@@ -3558,7 +3574,7 @@ pub fn render_ui(dir: &str) {
                 u.gpu_load = None;
                 u.mics = vec![("demo".into(), "マイク (USB Microphone)".into())];
                 u.mic = 1;
-            u.bitrate = 24;
+            u.bitrate = 24_000;
                 setup(&mut u);
             });
             let pop = open.map(|c| {
