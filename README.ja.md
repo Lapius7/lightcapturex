@@ -33,7 +33,7 @@ Windows 用の超軽量なゲーム録画ソフトです。約 0.6 MB の exe �
 
 [最新のリリース](https://github.com/Lapius7/lightcapturex/releases/latest)から、次のどちらかを入れます。
 
-- `lightcapturex-installer-vX.Y.Z.exe`: インストーラーです。ユーザーごとにインストールするので管理者権限はいりません。スタートメニューのショートカットと、Windows の設定に表示されるアンインストール項目が加わります。
+- `lightcapturex-installer-vX.Y.Z.exe`: インストーラーです。ユーザーごとにインストールするので管理者権限はいりません。スタートメニューのショートカット（デスクトップは任意）と、Windows の設定に表示されるアンインストール項目が加わります。
 - `lightcapturex.exe`: アプリ本体だけです。そのまま起動できます。
 
 どちらでも、更新はアプリ自身が確認します。
@@ -75,14 +75,13 @@ cargo build --release
 
 `target/x86_64-pc-windows-gnu/release/lightcapturex.exe` ができます。
 
-インストーラーは、この exe を埋め込んで作るので、先にアプリをビルドしてから実行します。
+インストーラーは [Inno Setup 6](https://jrsoftware.org/isinfo.php) で作ります。先にアプリをビルドしてから実行します。
 
 ```
-cd installer
-cargo build --release --target x86_64-pc-windows-gnu
+ISCC.exe /DAppVersion=X.Y.Z installer/lightcapturex.iss
 ```
 
-`installer/target/x86_64-pc-windows-gnu/release/lightcapturex-installer.exe` ができます。リリースするときは `lightcapturex-installer-vX.Y.Z.exe` に名前を変えます。
+`installer/Output/lightcapturex-installer-vX.Y.Z.exe` ができます。
 
 ## ライセンス
 
