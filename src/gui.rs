@@ -3292,7 +3292,7 @@ pub fn render_ui(dir: &str) {
                 u.elapsed = 754;
                 u.size_mb = 312.4;
                 u.blink = true;
-                u.info = "（エンコーダの表示）".into();
+                u.info = "GeForce RTX 4070 / H.264 Encoder".into();
                 u.hover = Some(Hit { ctl: Ctl::Rec, idx: 0 });
             }),
             None,
@@ -3304,7 +3304,7 @@ pub fn render_ui(dir: &str) {
                 u.elapsed = 754;
                 u.size_mb = 312.4;
                 u.blink = true;
-                u.info = "（エンコーダの表示）".into();
+                u.info = "GeForce RTX 4070 / H.264 Encoder".into();
                 u.fps_now = 59.0;
                 u.dropped = 3;
                 u.mbps = 24.6;
@@ -3313,7 +3313,6 @@ pub fn render_ui(dir: &str) {
                 u.fps_hist = (0..90).map(|i| if i == 40 || i == 41 { 44.0 } else { 58.0 + ((i * 7) % 5) as f32 * 0.5 }).collect();
                 u.meter = [0.72, 0.38];
                 u.hold = [0.85, 0.52];
-                u.mic = 1.min(u.mics.len());
             }),
             None,
         ),
@@ -3363,6 +3362,8 @@ pub fn render_ui(dir: &str) {
                 u.dropped = 0;
                 u.cpu = None;
                 u.gpu_load = None;
+                u.mics = vec![("demo".into(), "マイク (USB Microphone)".into())];
+                u.mic = 1;
                 setup(&mut u);
             });
             let pop = open.map(|c| {
