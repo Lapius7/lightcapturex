@@ -8,7 +8,7 @@ use crate::recorder::{self, Recorder, Settings};
 use crate::recs::{self, RecEntry};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use crate::{audio, d3d, log, stats, sysmon, tray};
+use crate::{audio, d3d, log, stats, sysmon, tray, update};
 use std::cell::RefCell;
 use std::path::PathBuf;
 use std::thread::LocalKey;
@@ -31,6 +31,7 @@ const TIMER: usize = 1;
 const METER: usize = 2;
 /// 別のインスタンスから「画面を出して」と頼むメッセージ
 const WM_SHOWME: u32 = WM_APP + 2;
+static ANNOUNCED: AtomicBool = AtomicBool::new(false);
 
 const QUALITIES: [&str; 4] = ["低", "中", "高", "最高"];
 const FPS: [u32; 2] = [30, 60];
@@ -64,8 +65,10 @@ enum Ctl {
     SetKeyReset,
     TogTray,
     TogNotify,
+    TogUpd,
+    UpdBtn,
 }
-const ORDER: [Ctl; 20] = [
+const ORDER: [Ctl; 22] = [
     Ctl::Tab,
     Ctl::Source,
     Ctl::Quality,
@@ -86,6 +89,8 @@ const ORDER: [Ctl; 20] = [
     Ctl::SetKeyReset,
     Ctl::TogTray,
     Ctl::TogNotify,
+    Ctl::TogUpd,
+    Ctl::UpdBtn,
 ];
 
 #[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
@@ -157,6 +162,7 @@ struct Ui {
     note: Option<String>,
     tray_close: bool,
     notify: bool,
+    auto_update: bool,
     tray_on: bool,
     list: Vec<RecEntry>,
     list_off: usize,
@@ -213,9 +219,9 @@ const VIDEO: R = R::new(PAD, 112.0, 412.0, 320.0);
 const AUDIO: R = R::new(448.0, 112.0, 292.0, 184.0);
 const PANEL: R = R::new(448.0, 312.0, 292.0, 120.0);
 const FOOTER: R = R::new(PAD, 448.0, W - PAD * 2.0, 32.0);
-const SET_DIR: R = R::new(PAD, 62.0, W - PAD * 2.0, 128.0);
-const SET_KEY: R = R::new(PAD, 204.0, W - PAD * 2.0, 100.0);
-const SET_ACT: R = R::new(PAD, 318.0, W - PAD * 2.0, 44.0 + ROW * 2.0);
+const SET_DIR: R = R::new(PAD, 62.0, W - PAD * 2.0, 116.0);
+const SET_KEY: R = R::new(PAD, 190.0, W - PAD * 2.0, 96.0);
+const SET_ACT: R = R::new(PAD, 298.0, W - PAD * 2.0, 44.0 + ROW * 3.0);
 const LIST: R = R::new(PAD, 96.0, W - PAD * 2.0, 344.0);
 const LROW: f32 = 56.0;
 const LVIS: usize = 6;
@@ -249,10 +255,12 @@ fn ctl_rect(c: Ctl) -> R {
         Ctl::ListRefresh => R::new(W - PAD - 96.0, 54.0, 96.0, 32.0),
         Ctl::SetDir => R::new(SET_DIR.right() - 16.0 - 96.0 - 8.0 - 96.0, SET_DIR.y + 52.0, 96.0, 32.0),
         Ctl::SetDirOpen => R::new(SET_DIR.right() - 16.0 - 96.0, SET_DIR.y + 52.0, 96.0, 32.0),
-        Ctl::SetKey => R::new(SET_KEY.right() - 16.0 - 96.0 - 8.0 - 112.0, SET_KEY.y + 48.0, 112.0, 32.0),
-        Ctl::SetKeyReset => R::new(SET_KEY.right() - 16.0 - 96.0, SET_KEY.y + 48.0, 96.0, 32.0),
+        Ctl::SetKey => R::new(SET_KEY.right() - 16.0 - 96.0 - 8.0 - 112.0, SET_KEY.y + 44.0, 112.0, 32.0),
+        Ctl::SetKeyReset => R::new(SET_KEY.right() - 16.0 - 96.0, SET_KEY.y + 44.0, 96.0, 32.0),
         Ctl::TogTray => row(SET_ACT, 0).inset(8.0, 2.0),
         Ctl::TogNotify => row(SET_ACT, 1).inset(8.0, 2.0),
+        Ctl::TogUpd => row(SET_ACT, 2).inset(8.0, 2.0),
+        Ctl::UpdBtn => R::new(SET_ACT.right() - 16.0 - 120.0, SET_ACT.y + 6.0, 120.0, 32.0),
         // 一覧の行の中身は list_row_rect で決める
         Ctl::ListOpen | Ctl::ListShow | Ctl::ListDel => R::default(),
     }
@@ -262,7 +270,7 @@ fn ctl_rect(c: Ctl) -> R {
 fn hit_rect(c: Ctl) -> R {
     match c {
         Ctl::Cursor => row(VIDEO, 5).inset(8.0, 2.0),
-        Ctl::Source | Ctl::Rec | Ctl::TogTray | Ctl::TogNotify => ctl_rect(c),
+        Ctl::Source | Ctl::Rec | Ctl::TogTray | Ctl::TogNotify | Ctl::TogUpd => ctl_rect(c),
         _ => ctl_rect(c).inset(0.0, -4.0),
     }
 }
@@ -306,7 +314,7 @@ fn enabled(u: &Ui, c: Ctl) -> bool {
         Ctl::Tab => true,
         Ctl::ListRefresh | Ctl::ListOpen | Ctl::ListShow | Ctl::ListDel => u.tab == Tab::List,
         Ctl::SetDir => u.tab == Tab::Set && !busy && u.status != Status::Recording,
-        Ctl::SetDirOpen | Ctl::SetKey | Ctl::SetKeyReset | Ctl::TogTray | Ctl::TogNotify => u.tab == Tab::Set && !busy,
+        Ctl::SetDirOpen | Ctl::SetKey | Ctl::SetKeyReset | Ctl::TogTray | Ctl::TogNotify | Ctl::TogUpd | Ctl::UpdBtn => u.tab == Tab::Set && !busy,
         _ if u.tab != Tab::Rec => false,
         _ => match u.status {
             Status::Starting | Status::Saving => c == Ctl::Folder,
@@ -978,11 +986,11 @@ fn draw_set(u: &Ui, p: &Painter) {
     draw_btn(u, p, Ctl::SetDir, Some(glyph::EDIT), "変更…");
     draw_btn(u, p, Ctl::SetDirOpen, Some(glyph::FOLDER), "開く");
     let free = u.free.map_or_else(|| "空き容量を調べられません".to_string(), |b| format!("空き容量  {}", recs::fmt_size(b)));
-    p.text(&free, R::new(SET_DIR.x + 16.0, SET_DIR.y + 94.0, SET_DIR.w - 32.0, 20.0), Font::text(12.0), tok::TEXT_3);
+    p.text(&free, R::new(SET_DIR.x + 16.0, SET_DIR.y + 88.0, SET_DIR.w - 32.0, 20.0), Font::text(12.0), tok::TEXT_3);
 
     // ショートカット
     card(p, SET_KEY, Some("ショートカット"));
-    let cy = SET_KEY.y + 48.0 + 16.0;
+    let cy = SET_KEY.y + 44.0 + 16.0;
     p.text("録画の開始・停止", R::new(SET_KEY.x + 16.0, cy - 16.0, 150.0, 32.0), Font::text(13.0), tok::TEXT);
     let kx = SET_KEY.x + 16.0 + 160.0;
     if u.capturing {
@@ -998,12 +1006,23 @@ fn draw_set(u: &Ui, p: &Painter) {
         (None, false) => ("このキーはほかのアプリが使用中です".to_string(), tok::TEXT_2),
         _ => ("Ctrl・Alt・Shift・Win と組み合わせることもできます".to_string(), tok::TEXT_3),
     };
-    p.text(&msg, R::new(SET_KEY.x + 16.0, SET_KEY.y + 80.0, SET_KEY.w - 32.0, 16.0), Font::text(11.5), col);
+    p.text(&msg, R::new(SET_KEY.x + 16.0, SET_KEY.y + 76.0, SET_KEY.w - 32.0, 16.0), Font::text(11.5), col);
 
     // 動作
     card(p, SET_ACT, Some("動作"));
     draw_switch(u, p, Ctl::TogTray, u.tray_close, "×で閉じたときトレーに残す", "オフにすると、×を押したときアプリを終了します");
     draw_switch(u, p, Ctl::TogNotify, u.notify, "トレーの通知", "録画の開始・保存・失敗をトレーから知らせます");
+    draw_switch(u, p, Ctl::TogUpd, u.auto_update, "起動時に更新を確認", "新しい版があれば通知します。更新は確認してから行います");
+    let (msg, btn) = match update::state() {
+        update::State::Checking => ("確認しています…".to_string(), "確認中…"),
+        update::State::Latest => (format!("v{} · 最新です", update::VERSION), "更新を確認"),
+        update::State::Available(v) => (format!("v{} → v{v} に更新できます", update::VERSION), "更新する"),
+        update::State::Downloading => ("ダウンロードしています…".to_string(), "更新中…"),
+        update::State::Failed(m) => (m, "更新を確認"),
+        update::State::Idle => (format!("v{}", update::VERSION), "更新を確認"),
+    };
+    p.text(&msg, R::new(SET_ACT.x + 72.0, SET_ACT.y + 12.0, SET_ACT.w - 72.0 - 16.0 - 128.0 - 8.0, 20.0), Font::text(12.0), tok::TEXT_3);
+    draw_btn(u, p, Ctl::UpdBtn, None, btn);
 }
 
 // ---- 録画一覧タブ ----
@@ -1787,6 +1806,10 @@ fn open_picker() {
         });
         let _ = EnableWindow(main, false);
         let _ = ShowWindow(hwnd, SW_SHOW);
+        update::cleanup();
+        if UI.with(|u| u.borrow().auto_update) {
+            update::check(hwnd);
+        }
         let mut msg = MSG::default();
         while PICK.with(|s| s.borrow().is_some()) {
             let r = GetMessageW(&mut msg, None, 0, 0);
@@ -1832,7 +1855,7 @@ fn save_config() {
         let codec = u.codecs.get(u.codec).map(|c| c.label()).unwrap_or_default();
         let gpu = if u.gpu == 0 { String::new() } else { u.gpus.get(u.gpu - 1).cloned().unwrap_or_default() };
         format!(
-            "source={src}\nquality={}\nfps={}\nres={}\nmic={mic}\nsysmode={}\napps={}\ncursor={}\ncodec={codec}\ngpu={gpu}\ndir={}\nhotkey={},{}\ntray_close={}\nnotify={}\n",
+            "source={src}\nquality={}\nfps={}\nres={}\nmic={mic}\nsysmode={}\napps={}\ncursor={}\ncodec={codec}\ngpu={gpu}\ndir={}\nhotkey={},{}\ntray_close={}\nnotify={}\nauto_update={}\n",
             u.quality,
             u.fps,
             u.res,
@@ -1843,7 +1866,8 @@ fn save_config() {
             u.hotkey.0,
             u.hotkey.1,
             u.tray_close as u8,
-            u.notify as u8
+            u.notify as u8,
+            u.auto_update as u8
         )
     });
     let p = config_path();
@@ -2424,6 +2448,27 @@ fn activate(h: Hit) {
             });
             save_and_repaint();
         }
+        Ctl::TogUpd => {
+            UI.with(|u| {
+                let mut u = u.borrow_mut();
+                u.auto_update = !u.auto_update;
+            });
+            save_and_repaint();
+        }
+        Ctl::UpdBtn => {
+            let hwnd = UI.with(|u| u.borrow().hwnd);
+            match update::state() {
+                update::State::Available(_) => {
+                    if UI.with(|u| u.borrow().status == Status::Recording) {
+                        notify("録画中は更新できません", "録画を止めてからもう一度押してください");
+                    } else {
+                        update::apply(hwnd);
+                    }
+                }
+                _ => update::check(hwnd),
+            }
+            invalidate_main();
+        }
         Ctl::ListRefresh => {
             refresh_list();
             invalidate_main();
@@ -2600,6 +2645,7 @@ fn init_values() {
         u.hotkey = hk.filter(|h| h.1 != 0).unwrap_or((0, VK_F9.0 as u32));
         u.tray_close = num("tray_close", 1) != 0;
         u.notify = num("notify", 1) != 0;
+        u.auto_update = num("auto_update", 1) != 0;
     });
     refresh_mics(cfg(&c, "mic").filter(|s| !s.is_empty()).map(String::from));
     if !apps.is_empty() {
@@ -2682,6 +2728,9 @@ fn tray_menu() {
         v.push(Item::cmd(800, "トレーから通知する").checked(u.notify));
         v.push(Item::cmd(801, "×で閉じたらトレーに残す").checked(u.tray_close));
         v.push(Item::Sep);
+        if let update::State::Available(ver) = update::state() {
+            v.push(Item::cmd(850, format!("v{ver} に更新する")));
+        }
         v.push(Item::cmd(900, "終了"));
         v
     });
@@ -2735,6 +2784,7 @@ fn tray_cmd(hwnd: HWND, id: u32) {
         }
         800 => activate(Hit { ctl: Ctl::TogNotify, idx: 0 }),
         801 => activate(Hit { ctl: Ctl::TogTray, idx: 0 }),
+        850 => activate(Hit { ctl: Ctl::UpdBtn, idx: 0 }),
         900 => quit(hwnd),
         _ => {}
     }
@@ -2888,6 +2938,19 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
             cancel_capture();
             LRESULT(0)
         }
+        m if m == update::WM_UPDATE => {
+            match update::state() {
+                update::State::Available(v) if !ANNOUNCED.swap(true, Ordering::Relaxed) => notify("新しいバージョンがあります", &format!("v{v} · 設定タブから更新できます")),
+                update::State::Failed(m) if UI.with(|u| u.borrow().tab == Tab::Set) => notify("更新できませんでした", &m),
+                _ => {}
+            }
+            invalidate_main();
+            LRESULT(0)
+        }
+        m if m == update::WM_UPDATE_QUIT => {
+            quit(hwnd);
+            LRESULT(0)
+        }
         WM_SHOWME => {
             show_window();
             LRESULT(0)
@@ -2984,7 +3047,16 @@ fn register(name: PCWSTR, proc_: WNDPROC, style: WNDCLASS_STYLES, bg: C, icon: b
 pub fn run() {
     unsafe {
         // すでに起動していたら、そのウィンドウを出して終わる
-        let m = windows::Win32::System::Threading::CreateMutexW(None, true, w!("Local\\LightCaptureX.single"));
+        // 更新直後は、古いほうが終わるのを少し待つ
+        let updated = std::env::args().nth(1).as_deref() == Some("--updated");
+        let mut m = windows::Win32::System::Threading::CreateMutexW(None, true, w!("Local\\LightCaptureX.single"));
+        for _ in 0..50 {
+            if !(updated && m.is_ok() && GetLastError() == ERROR_ALREADY_EXISTS) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            m = windows::Win32::System::Threading::CreateMutexW(None, true, w!("Local\\LightCaptureX.single"));
+        }
         if m.is_ok() && GetLastError() == ERROR_ALREADY_EXISTS {
             if let Ok(h) = FindWindowW(w!("LightCaptureX"), None) {
                 let _ = PostMessageW(Some(h), WM_SHOWME, WPARAM(0), LPARAM(0));

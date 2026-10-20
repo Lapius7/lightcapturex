@@ -13,6 +13,7 @@ mod recs;
 mod stats;
 mod sysmon;
 mod tray;
+mod update;
 
 use std::io::Write;
 use windows::Win32::Foundation::HWND;
@@ -38,7 +39,7 @@ fn main() {
         }
     }
     let args: Vec<String> = std::env::args().skip(1).collect();
-    if args.is_empty() {
+    if args.is_empty() || args[0] == "--updated" {
         gui::run();
     } else if args[0] == "--render-ui" && args.len() > 1 {
         // 画面を PNG に書き出すだけ（ウィンドウは出さない）
