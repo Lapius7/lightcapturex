@@ -31,7 +31,7 @@ Windows 用の超軽量なゲーム録画ソフトです。約 0.6 MB の exe �
 
 ## ダウンロード
 
-[最新のリリース](https://github.com/Lapius7/lightcapturex/releases/latest)から `lightcapturex.exe` を入れて起動します。更新は、アプリ自身が確認します。
+[最新のリリース](https://github.com/Lapius7/lightcapturex/releases/latest)から `lightcapturex.exe` を入れて起動します。更新はアプリ自身が確認します。
 
 ## 使い方
 
