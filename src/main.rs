@@ -9,6 +9,10 @@ mod encoder;
 mod gfx;
 mod gui;
 mod recorder;
+mod recs;
+mod stats;
+mod sysmon;
+mod tray;
 
 use std::io::Write;
 use windows::Win32::Foundation::HWND;

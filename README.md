@@ -2,7 +2,7 @@
 
 [日本語](README.ja.md)
 
-An ultra-lightweight game recorder for Windows. A single ~0.5 MB executable with no runtime dependencies.
+An ultra-lightweight game recorder for Windows. A single ~0.6 MB executable with no runtime dependencies.
 
 Capture, color conversion, scaling and encoding all run on the GPU, so it barely touches the CPU — useful for CPU-bound games such as VALORANT.
 
@@ -15,7 +15,11 @@ Capture, color conversion, scaling and encoding all run on the GPU, so it barely
 - Audio mixed into one track:
   - PC sound: off / everything / **selected apps only** (e.g. only VALORANT + Discord)
   - Microphone
-- Global hotkey **F9** to start/stop
+- Global hotkey to start/stop (default **F9**, changeable in the settings tab)
+- Live stats while recording: elapsed time, file size, real fps, dropped frames, audio level meters, CPU/GPU usage
+- Recordings tab: list, play, show in folder, delete
+- Changeable save folder
+- Tray icon: closing the window hides it to the tray; the icon blinks red while recording; menu for start/stop, recent recordings and quick settings; optional notifications
 - Settings are saved automatically
 
 ## Requirements
@@ -27,9 +31,9 @@ Capture, color conversion, scaling and encoding all run on the GPU, so it barely
 
 1. Run `lightcapturex.exe`.
 2. Choose what to record, quality, codec/GPU, microphone and PC sound.
-3. Press **F9** (or the record button) to start, and press it again to stop.
+3. Press the hotkey (default **F9**, or the record button) to start, and press it again to stop.
 
-Recordings are saved to `Videos\LightCaptureX\LightCaptureX_YYYYMMDD_HHMMSS.mp4`.
+Recordings are saved to `Videos\LightCaptureX\LightCaptureX_YYYYMMDD_HHMMSS.mp4` by default (changeable in the settings tab).
 
 ### Recording only some apps' sound
 
@@ -38,7 +42,7 @@ Set "PC の音" (PC sound) to "アプリ" (apps), then click the "アプリ" row
 ### Tips
 
 - If a game in exclusive fullscreen records as black, record the monitor instead of the window, or use borderless mode.
-- If F9 is taken by another app, the top right of the window says so.
+- If the hotkey is taken by another app, the top right of the window says so.
 
 ## Command line (for testing)
 

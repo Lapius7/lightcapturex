@@ -68,6 +68,10 @@ pub mod glyph {
     pub const REFRESH: u16 = 0xE72C;
     pub const WARNING: u16 = 0xE7BA;
     pub const ERROR: u16 = 0xEA39;
+    pub const PLAY: u16 = 0xE768;
+    pub const DELETE: u16 = 0xE74D;
+    pub const VIDEO: u16 = 0xE714;
+    pub const EDIT: u16 = 0xE70F;
 }
 
 #[derive(Clone, Copy, Default, PartialEq, Debug)]

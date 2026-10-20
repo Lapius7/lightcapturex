@@ -108,6 +108,7 @@ fn bitrate(w: u32, h: u32, fps: u32, quality: u32, codec: Codec) -> u32 {
 }
 
 pub fn start(s: Settings) -> Result<Recorder> {
+    crate::stats::reset();
     let stop = Arc::new(AtomicBool::new(false));
     let (tx, rx) = mpsc::channel::<Result<(Arc<Mutex<Encoder>>, i64, String)>>();
     let stop_v = stop.clone();
@@ -228,10 +229,12 @@ fn video_loop(s: Settings, stop: Arc<AtomicBool>, ready: Ready) -> Result<()> {
     let (mut written, mut skipped) = (index, 0u64);
     sleeper.until(t0 + (index as i128 * freq as i128 / fps as i128) as i64, freq);
     while !stop.load(Ordering::SeqCst) {
-        cap.latest(|t, c| match conv.process(t, c) {
+        if cap.latest(|t, c| match conv.process(t, c) {
             Ok(t) => last = Some(t),
             Err(e) => log(&format!("convert failed: {e}")),
-        });
+        }) {
+            crate::stats::FRESH.fetch_add(1, Ordering::Relaxed);
+        }
         // 新しいフレームが無ければ直前のフレームを繰り返して固定フレームレートを保つ
         if let Some(t) = &last {
             encoder.lock().unwrap().write_video(t, index)?;
@@ -241,6 +244,7 @@ fn video_loop(s: Settings, stop: Arc<AtomicBool>, ready: Ready) -> Result<()> {
         let now_idx = ((qpc() - t0) as i128 * fps as i128 / freq as i128) as u64;
         let next = (index + 1).max(now_idx);
         skipped += next - index - 1;
+        crate::stats::DROPPED.fetch_add(next - index - 1, Ordering::Relaxed);
         index = next;
         sleeper.until(t0 + (index as i128 * freq as i128 / fps as i128) as i64, freq);
     }

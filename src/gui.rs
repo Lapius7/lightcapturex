@@ -1,11 +1,14 @@
-//! Direct2D で自前描画する設定画面。F9 で録画の開始/停止。
+//! Direct2D で自前描画する設定画面。録画の開始/停止はショートカット（既定は F9）
 //! 配置は `ctl_rect` の1か所で決め、描画・当たり判定・画像出力（--render-ui）で共有する。
 use crate::apps::{self, AppEntry};
 use crate::capture::{list_sources, Source, SourceInfo};
 use crate::encoder::{self, Codec};
 use crate::gfx::{glyph, tok, Align, Font, Painter, C, R};
 use crate::recorder::{self, Recorder, Settings};
-use crate::{audio, d3d, log};
+use crate::recs::{self, RecEntry};
+use std::path::Path;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use crate::{audio, d3d, log, stats, sysmon, tray};
 use std::cell::RefCell;
 use std::path::PathBuf;
 use std::thread::LocalKey;
@@ -25,6 +28,9 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 const HOTKEY: i32 = 1;
 const WM_MOUSELEAVE: u32 = 0x02A3;
 const TIMER: usize = 1;
+const METER: usize = 2;
+/// 別のインスタンスから「画面を出して」と頼むメッセージ
+const WM_SHOWME: u32 = WM_APP + 2;
 
 const QUALITIES: [&str; 4] = ["低", "中", "高", "最高"];
 const FPS: [u32; 2] = [30, 60];
@@ -47,8 +53,20 @@ enum Ctl {
     Mic,
     Rec,
     Folder,
+    Tab,
+    ListRefresh,
+    ListOpen,
+    ListShow,
+    ListDel,
+    SetDir,
+    SetDirOpen,
+    SetKey,
+    SetKeyReset,
+    TogTray,
+    TogNotify,
 }
-const ORDER: [Ctl; 12] = [
+const ORDER: [Ctl; 20] = [
+    Ctl::Tab,
     Ctl::Source,
     Ctl::Quality,
     Ctl::Fps,
@@ -61,7 +79,23 @@ const ORDER: [Ctl; 12] = [
     Ctl::Mic,
     Ctl::Rec,
     Ctl::Folder,
+    Ctl::ListRefresh,
+    Ctl::SetDir,
+    Ctl::SetDirOpen,
+    Ctl::SetKey,
+    Ctl::SetKeyReset,
+    Ctl::TogTray,
+    Ctl::TogNotify,
 ];
+
+#[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
+enum Tab {
+    #[default]
+    Rec,
+    List,
+    Set,
+}
+const TABS: [Tab; 3] = [Tab::Rec, Tab::List, Tab::Set];
 
 /// 部品と、切り替えボタンなら何番目か
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -113,6 +147,33 @@ struct Ui {
     last_file: Option<PathBuf>,
     out_dir: String,
     hotkey_ok: bool,
+    tab: Tab,
+    free: Option<u64>,
+    /// ショートカット（修飾キー MOD_*, 仮想キー）
+    hotkey: (u32, u32),
+    /// ショートカットの入力待ち
+    capturing: bool,
+    /// 画面に出す短い通知（ショートカットが使えないときなど）
+    note: Option<String>,
+    tray_close: bool,
+    notify: bool,
+    tray_on: bool,
+    list: Vec<RecEntry>,
+    list_off: usize,
+    // 録画中の数値
+    fps_now: f32,
+    dropped: u64,
+    mbps: f32,
+    cpu: Option<u32>,
+    gpu_load: Option<u32>,
+    fps_hist: Vec<f32>,
+    last_fresh: u64,
+    last_bytes: u64,
+    last_t: Option<Instant>,
+    /// 音量メーター（PC の音, マイク）0..1 と、ピークの保持
+    meter: [f32; 2],
+    hold: [f32; 2],
+    hold_age: [u32; 2],
     status: Status,
     info: String,
     elapsed: u64,
@@ -152,6 +213,12 @@ const VIDEO: R = R::new(PAD, 112.0, 412.0, 320.0);
 const AUDIO: R = R::new(448.0, 112.0, 292.0, 184.0);
 const PANEL: R = R::new(448.0, 312.0, 292.0, 120.0);
 const FOOTER: R = R::new(PAD, 448.0, W - PAD * 2.0, 32.0);
+const SET_DIR: R = R::new(PAD, 62.0, W - PAD * 2.0, 128.0);
+const SET_KEY: R = R::new(PAD, 204.0, W - PAD * 2.0, 100.0);
+const SET_ACT: R = R::new(PAD, 318.0, W - PAD * 2.0, 44.0 + ROW * 2.0);
+const LIST: R = R::new(PAD, 96.0, W - PAD * 2.0, 344.0);
+const LROW: f32 = 56.0;
+const LVIS: usize = 6;
 const LABEL_V: f32 = 112.0;
 const LABEL_A: f32 = 72.0;
 
@@ -178,6 +245,16 @@ fn ctl_rect(c: Ctl) -> R {
         Ctl::Mic => field(AUDIO, 2, LABEL_A),
         Ctl::Rec => R::new(PANEL.x + 16.0, PANEL.bottom() - 56.0, PANEL.w - 32.0, 40.0),
         Ctl::Folder => R::new(FOOTER.right() - 140.0, FOOTER.y, 140.0, 32.0),
+        Ctl::Tab => R::new(176.0, 14.0, 216.0, 32.0),
+        Ctl::ListRefresh => R::new(W - PAD - 96.0, 54.0, 96.0, 32.0),
+        Ctl::SetDir => R::new(SET_DIR.right() - 16.0 - 96.0 - 8.0 - 96.0, SET_DIR.y + 52.0, 96.0, 32.0),
+        Ctl::SetDirOpen => R::new(SET_DIR.right() - 16.0 - 96.0, SET_DIR.y + 52.0, 96.0, 32.0),
+        Ctl::SetKey => R::new(SET_KEY.right() - 16.0 - 96.0 - 8.0 - 112.0, SET_KEY.y + 48.0, 112.0, 32.0),
+        Ctl::SetKeyReset => R::new(SET_KEY.right() - 16.0 - 96.0, SET_KEY.y + 48.0, 96.0, 32.0),
+        Ctl::TogTray => row(SET_ACT, 0).inset(8.0, 2.0),
+        Ctl::TogNotify => row(SET_ACT, 1).inset(8.0, 2.0),
+        // 一覧の行の中身は list_row_rect で決める
+        Ctl::ListOpen | Ctl::ListShow | Ctl::ListDel => R::default(),
     }
 }
 
@@ -185,7 +262,7 @@ fn ctl_rect(c: Ctl) -> R {
 fn hit_rect(c: Ctl) -> R {
     match c {
         Ctl::Cursor => row(VIDEO, 5).inset(8.0, 2.0),
-        Ctl::Source | Ctl::Rec => ctl_rect(c),
+        Ctl::Source | Ctl::Rec | Ctl::TogTray | Ctl::TogNotify => ctl_rect(c),
         _ => ctl_rect(c).inset(0.0, -4.0),
     }
 }
@@ -196,7 +273,7 @@ fn segs(r: R, n: usize) -> impl Iterator<Item = R> {
 }
 
 fn is_seg(c: Ctl) -> bool {
-    matches!(c, Ctl::Quality | Ctl::Fps | Ctl::Res | Ctl::Codec | Ctl::Sys)
+    matches!(c, Ctl::Quality | Ctl::Fps | Ctl::Res | Ctl::Codec | Ctl::Sys | Ctl::Tab)
 }
 
 fn seg_labels(u: &Ui, c: Ctl) -> Vec<String> {
@@ -206,6 +283,7 @@ fn seg_labels(u: &Ui, c: Ctl) -> Vec<String> {
         Ctl::Res => RES.map(|r| r.0.to_string()).to_vec(),
         Ctl::Codec => u.codecs.iter().map(|c| c.label().to_string()).collect(),
         Ctl::Sys => SYS_MODES.map(String::from).to_vec(),
+        Ctl::Tab => ["録画", "一覧", "設定"].map(String::from).to_vec(),
         _ => Vec::new(),
     }
 }
@@ -217,19 +295,64 @@ fn seg_value(u: &Ui, c: Ctl) -> usize {
         Ctl::Res => u.res,
         Ctl::Codec => u.codec,
         Ctl::Sys => u.sys,
+        Ctl::Tab => TABS.iter().position(|&t| t == u.tab).unwrap_or(0),
         _ => 0,
     }
 }
 
 fn enabled(u: &Ui, c: Ctl) -> bool {
-    match u.status {
-        Status::Starting | Status::Saving => c == Ctl::Folder,
-        Status::Recording => matches!(c, Ctl::Rec | Ctl::Folder),
-        _ => true,
+    let busy = matches!(u.status, Status::Starting | Status::Saving);
+    match c {
+        Ctl::Tab => true,
+        Ctl::ListRefresh | Ctl::ListOpen | Ctl::ListShow | Ctl::ListDel => u.tab == Tab::List,
+        Ctl::SetDir => u.tab == Tab::Set && !busy && u.status != Status::Recording,
+        Ctl::SetDirOpen | Ctl::SetKey | Ctl::SetKeyReset | Ctl::TogTray | Ctl::TogNotify => u.tab == Tab::Set && !busy,
+        _ if u.tab != Tab::Rec => false,
+        _ => match u.status {
+            Status::Starting | Status::Saving => c == Ctl::Folder,
+            Status::Recording => matches!(c, Ctl::Rec | Ctl::Folder),
+            _ => true,
+        },
     }
 }
 
+/// 一覧の行 i（表示中の何番目か）の範囲
+fn list_row_rect(i: usize) -> R {
+    R::new(LIST.x, LIST.y + i as f32 * LROW, LIST.w, LROW)
+}
+
+/// 行の右にある 3 つのボタン（再生, 場所, 削除）
+fn list_btn_rect(i: usize, k: usize) -> R {
+    let r = list_row_rect(i);
+    R::new(r.right() - 16.0 - 40.0 * (3 - k) as f32 - 4.0 * (2 - k) as f32, r.y + 8.0, 40.0, 40.0)
+}
+
+fn list_hit(u: &Ui, x: f32, y: f32) -> Option<Hit> {
+    for i in 0..LVIS {
+        let idx = u.list_off + i;
+        if idx >= u.list.len() {
+            break;
+        }
+        if list_row_rect(i).contains(x, y) {
+            let ctl = if list_btn_rect(i, 2).contains(x, y) {
+                Ctl::ListDel
+            } else if list_btn_rect(i, 1).contains(x, y) {
+                Ctl::ListShow
+            } else {
+                Ctl::ListOpen
+            };
+            return Some(Hit { ctl, idx });
+        }
+    }
+    None
+}
+
 fn hit_main(u: &Ui, x: f32, y: f32) -> Option<Hit> {
+    if u.tab == Tab::List {
+        if let Some(h) = list_hit(u, x, y) {
+            return Some(h);
+        }
+    }
     let c = *ORDER.iter().find(|&&c| enabled(u, c) && hit_rect(c).contains(x, y))?;
     let idx = if is_seg(c) {
         let n = seg_labels(u, c).len().max(1);
@@ -284,12 +407,73 @@ fn label(p: &Painter, card: R, i: usize, w: f32, s: &str, on: bool) {
     p.text(s, R::new(r.x + 16.0, r.y, w, r.h), Font::text(13.0), if on { tok::TEXT_2 } else { tok::TEXT_3 });
 }
 
-fn keycap(p: &Painter, r: R, fill: C, edge: Option<C>, fg: C) {
-    p.fill(r, 5.0, fill);
-    if let Some(e) = edge {
-        p.stroke(r, 5.0, e, 1.0);
+fn key_name(vk: u32) -> String {
+    match vk {
+        0x70..=0x87 => format!("F{}", vk - 0x6F),
+        0x30..=0x39 | 0x41..=0x5A => char::from_u32(vk).map(String::from).unwrap_or_default(),
+        0x20 => "Space".into(),
+        0x0D => "Enter".into(),
+        0x09 => "Tab".into(),
+        0x1B => "Esc".into(),
+        0x13 => "Pause".into(),
+        0x2C => "PrtSc".into(),
+        0x2D => "Ins".into(),
+        0x2E => "Del".into(),
+        0x24 => "Home".into(),
+        0x23 => "End".into(),
+        0x21 => "PgUp".into(),
+        0x22 => "PgDn".into(),
+        0x25 => "←".into(),
+        0x26 => "↑".into(),
+        0x27 => "→".into(),
+        0x28 => "↓".into(),
+        _ => unsafe {
+            let sc = MapVirtualKeyW(vk, MAPVK_VK_TO_VSC);
+            let mut buf = [0u16; 64];
+            let n = GetKeyNameTextW((sc << 16) as i32, &mut buf);
+            if n > 0 { String::from_utf16_lossy(&buf[..n as usize]) } else { format!("0x{vk:02X}") }
+        },
     }
-    p.text("F9", r, Font::strong(11.0).at(Align::Center), fg);
+}
+
+/// ショートカットを、キーの札ひとつずつの文字にする（例: Ctrl, Shift, R）
+fn key_parts(hk: (u32, u32)) -> Vec<String> {
+    let mut v = Vec::new();
+    for (bit, name) in [(MOD_CONTROL.0, "Ctrl"), (MOD_ALT.0, "Alt"), (MOD_SHIFT.0, "Shift"), (MOD_WIN.0, "Win")] {
+        if hk.0 & bit != 0 {
+            v.push(name.to_string());
+        }
+    }
+    v.push(key_name(hk.1));
+    v
+}
+
+fn key_text(hk: (u32, u32)) -> String {
+    key_parts(hk).join("+")
+}
+
+fn cap_w(p: &Painter, s: &str) -> f32 {
+    (p.measure(s, Font::strong(11.0)) + 16.0).max(30.0).ceil()
+}
+
+fn caps_width(p: &Painter, parts: &[String]) -> f32 {
+    parts.iter().map(|s| cap_w(p, s)).sum::<f32>() + 4.0 * parts.len().saturating_sub(1) as f32
+}
+
+/// キーの札を x から並べ、終わりの x を返す
+fn keycaps(p: &Painter, x: f32, cy: f32, parts: &[String], fill: C, edge: Option<C>, fg: C) -> f32 {
+    let mut x = x;
+    for s in parts {
+        let w = cap_w(p, s);
+        let r = R::new(x, cy - 10.0, w, 20.0);
+        p.fill(r, 5.0, fill);
+        if let Some(e) = edge {
+            p.stroke(r, 5.0, e, 1.0);
+        }
+        p.text(s, r, Font::strong(11.0).at(Align::Center), fg);
+        x += w + 4.0;
+    }
+    x - 4.0
 }
 
 /// アイコン。取れなかったアプリは頭文字の札にする
@@ -458,8 +642,10 @@ fn draw_rec(u: &Ui, p: &Painter) {
         p.dot(x0 + 5.0, cy, 5.0, tok::ON_ACCENT);
     }
     p.text(text, R::new(x0 + 18.0, r.y, tw + 4.0, r.h), f, fg);
-    if u.hotkey_ok {
-        keycap(p, R::new(r.right() - 42.0, cy - 10.0, 30.0, 20.0), cap, None, fg);
+    let parts = key_parts(u.hotkey);
+    let cw = caps_width(p, &parts);
+    if u.hotkey_ok && cw <= 64.0 {
+        keycaps(p, r.right() - 12.0 - cw, cy, &parts, cap, None, fg);
     }
     if s.press {
         p.unscale();
@@ -529,23 +715,41 @@ fn draw_folder(u: &Ui, p: &Painter) {
 
 fn draw_main(u: &Ui, p: &Painter) {
     // 見出し
-    p.text("LightCaptureX", R::new(PAD, 18.0, 300.0, 28.0), Font::strong(15.0), tok::TEXT);
-    let hr = R::new(W - PAD - 320.0, 18.0, 320.0, 28.0);
+    p.text("LightCaptureX", R::new(PAD, 18.0, 150.0, 28.0), Font::strong(15.0), tok::TEXT);
+    draw_seg(u, p, Ctl::Tab);
+    let hr = R::new(W - PAD - 330.0, 18.0, 330.0, 28.0);
     let small = Font::text(12.0);
     if u.hotkey_ok {
         let t = "で録画を開始・停止";
         let tw = p.measure(t, small);
         p.text(t, R::new(hr.right() - tw - 2.0, hr.y, tw + 2.0, hr.h), small, tok::TEXT_3);
-        keycap(p, R::new(hr.right() - tw - 40.0, hr.y + 4.0, 30.0, 20.0), tok::CTRL, Some(tok::EDGE), tok::TEXT_2);
+        let parts = key_parts(u.hotkey);
+        let cw = caps_width(p, &parts);
+        keycaps(p, hr.right() - tw - 10.0 - cw, hr.y + 14.0, &parts, tok::CTRL, Some(tok::EDGE), tok::TEXT_2);
     } else {
-        let t = "F9 はほかのアプリが使用中";
-        let tw = p.measure(t, small);
-        p.text(t, R::new(hr.right() - tw - 2.0, hr.y, tw + 2.0, hr.h), small, tok::TEXT_2);
+        let t = format!("{} はほかのアプリが使用中", key_text(u.hotkey));
+        let tw = p.measure(&t, small);
+        p.text(&t, R::new(hr.right() - tw - 2.0, hr.y, tw + 2.0, hr.h), small, tok::TEXT_2);
         p.glyph(glyph::WARNING, R::new(hr.right() - tw - 24.0, hr.y, 16.0, hr.h), 12.0, tok::TEXT_2);
     }
+    match u.tab {
+        Tab::Rec => draw_rec_tab(u, p),
+        Tab::List => draw_list(u, p),
+        Tab::Set => draw_set(u, p),
+    }
+}
 
+fn draw_rec_tab(u: &Ui, p: &Painter) {
     draw_source(u, p);
 
+    let live = u.status == Status::Recording;
+    if live {
+        draw_live(u, p);
+        draw_meters(u, p);
+        draw_panel(u, p);
+        draw_footer(u, p);
+        return;
+    }
     // 映像
     card(p, VIDEO, Some("映像"));
     let on = enabled(u, Ctl::Quality);
@@ -570,7 +774,11 @@ fn draw_main(u: &Ui, p: &Painter) {
     draw_text_select(u, p, Ctl::Mic, &mic);
 
     draw_panel(u, p);
+    draw_footer(u, p);
+}
 
+fn draw_footer(u: &Ui, p: &Painter) {
+    let small = Font::text(12.0);
     // 下の行: 録画中はエンコーダ、終わったらファイル名かエラーの詳細
     let (text, col) = match &u.status {
         Status::Recording => (u.info.clone(), tok::TEXT_3),
@@ -580,6 +788,290 @@ fn draw_main(u: &Ui, p: &Painter) {
     };
     p.text(&text, R::new(FOOTER.x + 4.0, FOOTER.y, FOOTER.w - 160.0, FOOTER.h), small, col);
     draw_folder(u, p);
+}
+
+// ---- リアルタイム表示 ----
+
+/// 長いパスは先頭を省いて幅に収める
+fn fit(p: &Painter, s: &str, f: Font, w: f32) -> String {
+    if p.measure(s, f) <= w {
+        return s.to_string();
+    }
+    let chars: Vec<char> = s.chars().collect();
+    for skip in 1..chars.len() {
+        let t: String = std::iter::once('…').chain(chars[skip..].iter().copied()).collect();
+        if p.measure(&t, f) <= w {
+            return t;
+        }
+    }
+    String::new()
+}
+
+fn tile(p: &Painter, r: R, label: &str, value: &str, unit: &str, hot: bool) {
+    p.fill(r, tok::R_CTRL, tok::CTRL);
+    p.text(label, R::new(r.x + 12.0, r.y + 8.0, r.w - 24.0, 16.0), Font::text(11.5), tok::TEXT_3);
+    let vf = Font::strong(20.0);
+    let col = if hot { tok::REC } else { tok::TEXT };
+    p.text(value, R::new(r.x + 12.0, r.y + 28.0, r.w - 24.0, 30.0), vf, col);
+    if !unit.is_empty() {
+        let vw = p.measure(value, vf);
+        p.text(unit, R::new(r.x + 14.0 + vw, r.y + 33.0, r.w - 24.0 - vw, 22.0), Font::text(12.0), tok::TEXT_3);
+    }
+}
+
+fn pct(v: Option<u32>) -> (String, &'static str) {
+    match v {
+        Some(v) => (v.to_string(), "%"),
+        None => ("—".into(), ""),
+    }
+}
+
+fn draw_live(u: &Ui, p: &Painter) {
+    card(p, VIDEO, Some("リアルタイム"));
+    let target = FPS[u.fps.min(FPS.len() - 1)] as f32;
+    let tw = (VIDEO.w - 32.0 - 16.0) / 3.0;
+    let tr = |col: usize, rw: usize| R::new(VIDEO.x + 16.0 + col as f32 * (tw + 8.0), VIDEO.y + 44.0 + rw as f32 * 72.0, tw, 64.0);
+    tile(p, tr(0, 0), "ファイルサイズ", &format!("{:.1}", u.size_mb), "MB", false);
+    tile(p, tr(1, 0), "実 fps", &format!("{:.0}", u.fps_now), &format!("/ {target:.0}"), u.fps_now > 0.0 && u.fps_now < target * 0.9);
+    tile(p, tr(2, 0), "ドロップ", &u.dropped.to_string(), "枚", u.dropped > 0);
+    let (c, cu) = pct(u.cpu);
+    let (g, gu) = pct(u.gpu_load);
+    tile(p, tr(0, 1), "CPU", &c, cu, u.cpu.is_some_and(|v| v >= 90));
+    tile(p, tr(1, 1), "GPU", &g, gu, u.gpu_load.is_some_and(|v| v >= 95));
+    tile(p, tr(2, 1), "ビットレート", &format!("{:.1}", u.mbps), "Mbps", false);
+
+    // fps の推移
+    let top = VIDEO.y + 44.0 + 144.0 + 4.0;
+    p.text("fps の推移（直近 60 秒）", R::new(VIDEO.x + 16.0, top, 240.0, 18.0), Font::text(11.5), tok::TEXT_3);
+    let g = R::new(VIDEO.x + 16.0, top + 22.0, VIDEO.w - 32.0, VIDEO.bottom() - 16.0 - (top + 22.0));
+    p.fill(g, tok::R_CTRL, tok::CTRL);
+    let top_v = (target * 1.1).max(u.fps_hist.iter().copied().fold(0.0, f32::max));
+    let pad = 8.0;
+    let (gx, gy, gw, gh) = (g.x + pad, g.y + pad, g.w - pad * 2.0, g.h - pad * 2.0);
+    let yv = |v: f32| gy + gh - (v / top_v).clamp(0.0, 1.0) * gh;
+    p.line(gx, yv(target), gx + gw, yv(target), tok::HAIR, 1.0);
+    let n = u.fps_hist.len();
+    if n >= 2 {
+        let step = gw / 119.0;
+        let x0 = gx + gw - step * (n - 1) as f32;
+        for i in 1..n {
+            let (a, b) = (u.fps_hist[i - 1], u.fps_hist[i]);
+            let col = if b < target * 0.9 { tok::REC } else { tok::TEXT_2 };
+            p.line(x0 + step * (i - 1) as f32, yv(a), x0 + step * i as f32, yv(b), col, 1.5);
+        }
+        p.dot(gx + gw, yv(u.fps_hist[n - 1]), 3.0, tok::TEXT);
+    } else {
+        p.text("計測しています…", g, Font::text(12.0).at(Align::Center), tok::TEXT_3);
+    }
+}
+
+/// -60 dB..0 dB を 0..1 にする
+fn db_level(peak: f32) -> f32 {
+    if peak <= 0.000_001 {
+        0.0
+    } else {
+        ((20.0 * peak.log10() + 60.0) / 60.0).clamp(0.0, 1.0)
+    }
+}
+
+fn draw_meters(u: &Ui, p: &Painter) {
+    card(p, AUDIO, Some("音量"));
+    let sys_on = match u.sys {
+        0 => false,
+        SYS_APPS => !u.apps.is_empty(),
+        _ => true,
+    };
+    let rows = [("PC の音", sys_on, 0usize), ("マイク", u.mic != 0, 1usize)];
+    for (i, (name, on, k)) in rows.into_iter().enumerate() {
+        let y = AUDIO.y + 52.0 + i as f32 * 60.0;
+        let col = if on { tok::TEXT } else { tok::TEXT_3 };
+        p.text(name, R::new(AUDIO.x + 16.0, y, 140.0, 18.0), Font::text(13.0), col);
+        let tr = R::new(AUDIO.x + 16.0, y + 26.0, AUDIO.w - 32.0, 8.0);
+        p.fill(tr, 4.0, tok::CTRL);
+        if !on {
+            p.text("オフ", R::new(AUDIO.right() - 16.0 - 60.0, y, 60.0, 18.0), Font::text(12.0).at(Align::Right), tok::TEXT_3);
+            continue;
+        }
+        let lv = u.meter[k];
+        if lv > 0.01 {
+            let w = (tr.w * lv).max(8.0);
+            let c = if lv > 0.93 { tok::REC } else if lv > 0.75 { tok::TEXT } else { tok::TEXT_2 };
+            p.fill(R::new(tr.x, tr.y, w, tr.h), 4.0, c);
+        }
+        let h = u.hold[k];
+        if h > 0.02 {
+            let x = tr.x + (tr.w - 2.0) * h;
+            p.fill(R::new(x, tr.y - 3.0, 2.0, tr.h + 6.0), 1.0, if h > 0.93 { tok::REC } else { tok::TEXT });
+        }
+    }
+}
+
+// ---- 設定タブ ----
+
+fn draw_btn(u: &Ui, p: &Painter, c: Ctl, icon: Option<u16>, text: &str) {
+    let r = ctl_rect(c);
+    let s = st(u, c, 0);
+    if s.press {
+        p.scale(r, 0.96);
+    }
+    let fill = if !s.on {
+        tok::CTRL
+    } else if s.press {
+        tok::CTRL_PRESS
+    } else if s.hover {
+        tok::CTRL_HOVER
+    } else {
+        tok::CTRL
+    };
+    p.fill(r, tok::R_CTRL, fill);
+    let fg = if !s.on { tok::TEXT_3 } else if s.hover { tok::TEXT } else { tok::TEXT_2 };
+    let f = Font::text(12.5);
+    let tw = p.measure(text, f);
+    let iw = if icon.is_some() { 22.0 } else { 0.0 };
+    let x0 = (r.x + (r.w - iw - tw) / 2.0).round();
+    if let Some(g) = icon {
+        p.glyph(g, R::new(x0, r.y, 16.0, r.h), 13.0, fg);
+    }
+    p.text(text, R::new(x0 + iw, r.y, tw + 4.0, r.h), f, fg);
+    if s.press {
+        p.unscale();
+    }
+    if s.focus {
+        ring(p, r, tok::R_CTRL);
+    }
+}
+
+fn draw_switch(u: &Ui, p: &Painter, c: Ctl, on_state: bool, title: &str, sub: &str) {
+    let r = ctl_rect(c);
+    let s = st(u, c, 0);
+    if s.hover && s.on {
+        p.fill(r, tok::R_CTRL, tok::CTRL);
+    }
+    let fg = if s.on { tok::TEXT } else { tok::TEXT_3 };
+    p.text(title, R::new(r.x + 8.0, r.y + 3.0, r.w - 80.0, 18.0), Font::text(13.0), fg);
+    p.text(sub, R::new(r.x + 8.0, r.y + 21.0, r.w - 80.0, 16.0), Font::text(11.5), tok::TEXT_3);
+    let t = R::new(r.right() - 8.0 - 36.0, r.y + 10.0, 36.0, 20.0);
+    let track = match (on_state, s.on) {
+        (true, true) => tok::TEXT,
+        (true, false) => tok::TEXT_3,
+        (false, _) if s.hover => tok::SEG_ON,
+        _ => tok::CTRL_HOVER,
+    };
+    p.fill(t, 10.0, track);
+    let kx = if on_state { t.right() - 10.0 } else { t.x + 10.0 };
+    let knob = if on_state { tok::BG } else if s.on { tok::TEXT_2 } else { tok::TEXT_3 };
+    p.dot(kx, t.y + 10.0, 7.0, knob);
+    if s.focus {
+        ring(p, t, 10.0);
+    }
+}
+
+fn draw_set(u: &Ui, p: &Painter) {
+    // 保存先
+    card(p, SET_DIR, Some("保存先"));
+    let fr = R::new(SET_DIR.x + 16.0, SET_DIR.y + 52.0, ctl_rect(Ctl::SetDir).x - 8.0 - (SET_DIR.x + 16.0), 32.0);
+    p.fill(fr, tok::R_CTRL, tok::CTRL);
+    p.glyph(glyph::FOLDER, R::new(fr.x + 12.0, fr.y, 18.0, fr.h), 14.0, tok::TEXT_2);
+    let f = Font::text(12.5);
+    let path = fit(p, &u.out_dir, f, fr.w - 52.0);
+    p.text(&path, R::new(fr.x + 38.0, fr.y, fr.w - 46.0, fr.h), f, tok::TEXT);
+    draw_btn(u, p, Ctl::SetDir, Some(glyph::EDIT), "変更…");
+    draw_btn(u, p, Ctl::SetDirOpen, Some(glyph::FOLDER), "開く");
+    let free = u.free.map_or_else(|| "空き容量を調べられません".to_string(), |b| format!("空き容量  {}", recs::fmt_size(b)));
+    p.text(&free, R::new(SET_DIR.x + 16.0, SET_DIR.y + 94.0, SET_DIR.w - 32.0, 20.0), Font::text(12.0), tok::TEXT_3);
+
+    // ショートカット
+    card(p, SET_KEY, Some("ショートカット"));
+    let cy = SET_KEY.y + 48.0 + 16.0;
+    p.text("録画の開始・停止", R::new(SET_KEY.x + 16.0, cy - 16.0, 150.0, 32.0), Font::text(13.0), tok::TEXT);
+    let kx = SET_KEY.x + 16.0 + 160.0;
+    if u.capturing {
+        p.dot(kx + 4.0, cy, 4.0, tok::REC);
+        p.text("キーを押してください（Esc で取り消し）", R::new(kx + 16.0, cy - 16.0, 300.0, 32.0), Font::text(13.0), tok::TEXT);
+    } else {
+        keycaps(p, kx, cy, &key_parts(u.hotkey), tok::CTRL, Some(tok::EDGE), tok::TEXT);
+    }
+    draw_btn(u, p, Ctl::SetKey, None, if u.capturing { "取り消し" } else { "変更…" });
+    draw_btn(u, p, Ctl::SetKeyReset, None, "F9 に戻す");
+    let (msg, col) = match (&u.note, u.hotkey_ok) {
+        (Some(n), _) => (n.clone(), tok::TEXT_2),
+        (None, false) => ("このキーはほかのアプリが使用中です".to_string(), tok::TEXT_2),
+        _ => ("Ctrl・Alt・Shift・Win と組み合わせることもできます".to_string(), tok::TEXT_3),
+    };
+    p.text(&msg, R::new(SET_KEY.x + 16.0, SET_KEY.y + 80.0, SET_KEY.w - 32.0, 16.0), Font::text(11.5), col);
+
+    // 動作
+    card(p, SET_ACT, Some("動作"));
+    draw_switch(u, p, Ctl::TogTray, u.tray_close, "×で閉じたときトレーに残す", "オフにすると、×を押したときアプリを終了します");
+    draw_switch(u, p, Ctl::TogNotify, u.notify, "トレーの通知", "録画の開始・保存・失敗をトレーから知らせます");
+}
+
+// ---- 録画一覧タブ ----
+
+fn draw_list(u: &Ui, p: &Painter) {
+    let total: u64 = u.list.iter().map(|e| e.size).sum();
+    let head = if u.list.is_empty() { "録画".to_string() } else { format!("{} 件  ·  合計 {}", u.list.len(), recs::fmt_size(total)) };
+    p.text(&head, R::new(PAD + 4.0, 54.0, 400.0, 32.0), Font::text(12.5), tok::TEXT_2);
+    draw_btn(u, p, Ctl::ListRefresh, Some(glyph::REFRESH), "更新");
+    card(p, LIST, None);
+    if u.list.is_empty() {
+        let c = R::new(LIST.x, LIST.y + LIST.h / 2.0 - 30.0, LIST.w, 28.0);
+        p.text("録画はまだありません", c, Font::strong(14.0).at(Align::Center), tok::TEXT_2);
+        let hint = if u.hotkey_ok { format!("{} を押すと録画を始めます", key_text(u.hotkey)) } else { "録画タブの「録画開始」から始められます".to_string() };
+        p.text(&hint, R::new(c.x, c.bottom() + 2.0, c.w, 22.0), Font::text(12.5).at(Align::Center), tok::TEXT_3);
+    }
+    let shown = u.list.len().saturating_sub(u.list_off).min(LVIS);
+    for i in 0..shown {
+        let idx = u.list_off + i;
+        let e = &u.list[idx];
+        let rr = list_row_rect(i);
+        let row_hot = matches!(u.hover, Some(Hit { ctl: Ctl::ListOpen | Ctl::ListShow | Ctl::ListDel, idx: h }) if h == idx);
+        if row_hot {
+            let pressed = matches!(u.press, Some(Hit { ctl: Ctl::ListOpen, idx: h }) if h == idx) && u.hover == u.press;
+            p.fill(rr.inset(6.0, 4.0), tok::R_CTRL, if pressed { tok::CTRL_PRESS } else { tok::CTRL });
+        } else if i + 1 < shown {
+            p.line(rr.x + 16.0, rr.bottom(), rr.right() - 16.0, rr.bottom(), tok::HAIR, 1.0);
+        }
+        let ic = R::new(rr.x + 16.0, rr.y + 14.0, 28.0, 28.0);
+        p.fill(ic, tok::R_CTRL, if row_hot { tok::SEG_ON } else { tok::CTRL });
+        p.glyph(glyph::VIDEO, ic, 14.0, tok::TEXT_2);
+        let nw = list_btn_rect(i, 0).x - (rr.x + 56.0) - 8.0;
+        let nf = Font::strong(13.0);
+        p.text(&fit(p, &e.name, nf, nw), R::new(rr.x + 56.0, rr.y + 9.0, nw, 20.0), nf, tok::TEXT);
+        let (y, mo, d, h, mi) = e.when;
+        let mut meta = Vec::new();
+        if y != 0 {
+            meta.push(format!("{y}/{mo:02}/{d:02} {h:02}:{mi:02}"));
+        }
+        if let Some(s) = e.secs {
+            meta.push(recs::fmt_dur(s));
+        }
+        meta.push(recs::fmt_size(e.size));
+        p.text(&meta.join("  ·  "), R::new(rr.x + 56.0, rr.y + 30.0, nw, 16.0), Font::text(11.5), tok::TEXT_3);
+        for (k, g) in [glyph::PLAY, glyph::FOLDER, glyph::DELETE].into_iter().enumerate() {
+            let ctl = [Ctl::ListOpen, Ctl::ListShow, Ctl::ListDel][k];
+            let br = list_btn_rect(i, k);
+            let hov = u.hover == Some(Hit { ctl, idx }) && k > 0;
+            let down = u.press == Some(Hit { ctl, idx }) && hov;
+            if hov {
+                p.fill(br.inset(2.0, 2.0), tok::R_CTRL, if down { tok::CTRL_PRESS } else { tok::SEG_ON });
+            }
+            let col = if !row_hot { tok::TEXT_3 } else if hov && k == 2 { tok::REC } else if hov { tok::TEXT } else { tok::TEXT_2 };
+            p.glyph(g, br, 14.0, col);
+        }
+    }
+    if u.list.len() > LVIS {
+        let track = R::new(LIST.right() - 7.0, LIST.y + 10.0, 3.0, LIST.h - 20.0);
+        let n = u.list.len() as f32;
+        let th = (track.h * LVIS as f32 / n).max(24.0);
+        let ty = track.y + (track.h - th) * u.list_off as f32 / (n - LVIS as f32);
+        p.fill(R::new(track.x, ty, track.w, th), 1.5, tok::SEG_ON);
+    }
+    let (t, col) = match &u.note {
+        Some(n) => (n.clone(), tok::TEXT_2),
+        None => (format!("保存先  {}", u.out_dir), tok::TEXT_3),
+    };
+    p.text(&fit(p, &t, Font::text(12.0), FOOTER.w - 8.0), R::new(FOOTER.x + 4.0, FOOTER.y, FOOTER.w - 8.0, FOOTER.h), Font::text(12.0), col);
 }
 
 // ---- 一覧（ドロップダウン）----
@@ -1340,13 +1832,18 @@ fn save_config() {
         let codec = u.codecs.get(u.codec).map(|c| c.label()).unwrap_or_default();
         let gpu = if u.gpu == 0 { String::new() } else { u.gpus.get(u.gpu - 1).cloned().unwrap_or_default() };
         format!(
-            "source={src}\nquality={}\nfps={}\nres={}\nmic={mic}\nsysmode={}\napps={}\ncursor={}\ncodec={codec}\ngpu={gpu}\n",
+            "source={src}\nquality={}\nfps={}\nres={}\nmic={mic}\nsysmode={}\napps={}\ncursor={}\ncodec={codec}\ngpu={gpu}\ndir={}\nhotkey={},{}\ntray_close={}\nnotify={}\n",
             u.quality,
             u.fps,
             u.res,
             u.sys,
             u.apps.join("|"),
-            u.cursor as u8
+            u.cursor as u8,
+            u.out_dir,
+            u.hotkey.0,
+            u.hotkey.1,
+            u.tray_close as u8,
+            u.notify as u8
         )
     });
     let p = config_path();
@@ -1394,7 +1891,7 @@ fn selected_mic_id() -> Option<String> {
 
 // ---- 録画 ----
 
-fn output_dir() -> PathBuf {
+fn default_dir() -> PathBuf {
     let videos = unsafe {
         SHGetKnownFolderPath(&FOLDERID_Videos, KF_FLAG_DEFAULT, None).ok().and_then(|p| {
             let s = p.to_string().ok();
@@ -1403,6 +1900,12 @@ fn output_dir() -> PathBuf {
         })
     };
     videos.map(PathBuf::from).unwrap_or_else(std::env::temp_dir).join("LightCaptureX")
+}
+
+/// 録画の保存先（設定したフォルダ。未設定ならビデオ\LightCaptureX）
+fn output_dir() -> PathBuf {
+    let d = UI.with(|u| u.borrow().out_dir.clone());
+    if d.is_empty() { default_dir() } else { PathBuf::from(d) }
 }
 
 fn new_file_path() -> PathBuf {
@@ -1482,11 +1985,35 @@ fn start_recording() {
                 u.blink = true;
                 u.hwnd
             });
-            unsafe { SetTimer(Some(hwnd), TIMER, 500, None) };
+            UI.with(|u| {
+                let mut u = u.borrow_mut();
+                u.fps_now = 0.0;
+                u.dropped = 0;
+                u.mbps = 0.0;
+                u.cpu = None;
+                u.gpu_load = None;
+                u.fps_hist.clear();
+                u.last_fresh = 0;
+                u.last_bytes = 0;
+                u.last_t = None;
+                u.meter = [0.0; 2];
+                u.hold = [0.0; 2];
+                u.hold_age = [0; 2];
+                u.note = None;
+            });
+            sysmon::start();
+            unsafe {
+                SetTimer(Some(hwnd), TIMER, 500, None);
+                SetTimer(Some(hwnd), METER, 50, None);
+            }
+            update_tray(true);
+            notify("録画を開始しました", "");
         }
         Err(e) => {
             log(&format!("start: {e}"));
-            set_status(Status::Failed("開始できませんでした".into(), e.message()));
+            let m = e.message();
+            notify("開始できませんでした", &m);
+            set_status(Status::Failed("開始できませんでした".into(), m));
         }
     }
     invalidate_all();
@@ -1495,32 +2022,262 @@ fn start_recording() {
 fn stop_recording() {
     let Some((r, _, path)) = UI.with(|u| u.borrow_mut().rec.take()) else { return };
     let hwnd = UI.with(|u| u.borrow().hwnd);
-    unsafe { let _ = KillTimer(Some(hwnd), TIMER); }
+    unsafe {
+        let _ = KillTimer(Some(hwnd), TIMER);
+        let _ = KillTimer(Some(hwnd), METER);
+    }
+    sysmon::stop();
     set_status(Status::Saving);
     repaint_now();
     let res = r.stop();
     let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     match res {
-        Ok(()) => set_status(Status::Saved(name)),
+        Ok(()) => {
+            notify("録画を保存しました", &name);
+            set_status(Status::Saved(name));
+        }
         Err(e) => {
             log(&format!("stop: {e}"));
-            set_status(Status::Failed("保存中にエラーが発生しました".into(), e.message()));
+            let m = e.message();
+            notify("保存中にエラーが発生しました", &m);
+            set_status(Status::Failed("保存中にエラーが発生しました".into(), m));
         }
     }
-    UI.with(|u| u.borrow_mut().last_file = Some(path));
+    UI.with(|u| {
+        let mut u = u.borrow_mut();
+        u.last_file = Some(path);
+        u.meter = [0.0; 2];
+        u.hold = [0.0; 2];
+    });
+    update_tray(false);
+    if UI.with(|u| u.borrow().tab) == Tab::List {
+        refresh_list();
+    }
     invalidate_all();
 }
 
+const TIP: &str = "LightCaptureX";
+
+/// トレーのアイコンと説明を、いまの状態に合わせる。red は点滅の明暗
+fn update_tray(red: bool) {
+    let (hwnd, on, rec, secs) = UI.with(|u| {
+        let u = u.borrow();
+        (u.hwnd, u.tray_on, u.status == Status::Recording, u.elapsed)
+    });
+    if !on {
+        return;
+    }
+    let tip = if rec { format!("{TIP} — 録画中 {}", recs::fmt_dur(secs)) } else { TIP.to_string() };
+    tray::set(hwnd, rec && red, &tip);
+}
+
+/// トレーから通知を出す（設定でオフなら出さない）
+fn notify(title: &str, text: &str) {
+    let (hwnd, on) = UI.with(|u| (u.borrow().hwnd, u.borrow().notify && u.borrow().tray_on));
+    if on {
+        tray::balloon(hwnd, title, text);
+    }
+}
+
+fn window_visible() -> bool {
+    let h = UI.with(|u| u.borrow().hwnd);
+    unsafe { IsWindowVisible(h).as_bool() && !IsIconic(h).as_bool() }
+}
+
 fn tick() {
-    UI.with(|u| {
+    let fresh = stats::FRESH.load(Ordering::Relaxed);
+    let dropped = stats::DROPPED.load(Ordering::Relaxed);
+    let (cpu, gpu) = sysmon::read();
+    let now = Instant::now();
+    let blink = UI.with(|u| {
         let mut u = u.borrow_mut();
-        let Some((_, t, path)) = &u.rec else { return };
-        let (s, size) = (t.elapsed().as_secs(), std::fs::metadata(path).map(|m| m.len()).unwrap_or(0));
-        u.elapsed = s;
+        let (secs, path) = match &u.rec {
+            Some((_, t, p)) => (t.elapsed().as_secs(), p.clone()),
+            None => return None,
+        };
+        let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        let dt = u.last_t.map_or(0.5, |l| now.duration_since(l).as_secs_f32()).max(0.05);
+        u.fps_now = fresh.saturating_sub(u.last_fresh) as f32 / dt;
+        u.mbps = size.saturating_sub(u.last_bytes) as f32 * 8.0 / 1_000_000.0 / dt;
+        u.last_fresh = fresh;
+        u.last_bytes = size;
+        u.last_t = Some(now);
+        u.dropped = dropped;
+        u.cpu = cpu;
+        u.gpu_load = gpu;
+        let f = u.fps_now;
+        u.fps_hist.push(f);
+        if u.fps_hist.len() > 120 {
+            u.fps_hist.remove(0);
+        }
+        u.elapsed = secs;
         u.size_mb = size as f64 / 1_048_576.0;
         u.blink = !u.blink;
+        Some(u.blink)
+    });
+    if let Some(b) = blink {
+        update_tray(b);
+    }
+    if window_visible() {
+        invalidate_main();
+    }
+}
+
+/// 音量メーター（録画中だけ約 50ms ごと）
+fn meter_tick() {
+    let (s, m) = stats::take_peaks();
+    let show = UI.with(|u| {
+        let mut u = u.borrow_mut();
+        for (k, pk) in [s, m].into_iter().enumerate() {
+            let lv = db_level(pk);
+            u.meter[k] = lv.max(u.meter[k] * 0.86);
+            if lv >= u.hold[k] {
+                u.hold[k] = lv;
+                u.hold_age[k] = 0;
+            } else {
+                u.hold_age[k] += 1;
+                if u.hold_age[k] > 24 {
+                    u.hold[k] = (u.hold[k] - 0.02).max(lv);
+                }
+            }
+        }
+        u.tab == Tab::Rec && u.status == Status::Recording
+    });
+    if show && window_visible() {
+        invalidate_main();
+    }
+}
+
+fn open_path(p: &Path) {
+    unsafe {
+        ShellExecuteW(None, w!("open"), &HSTRING::from(p.as_os_str()), None, None, SW_SHOWNORMAL);
+    }
+}
+
+fn show_in_folder(f: &Path) {
+    unsafe {
+        ShellExecuteW(None, w!("open"), w!("explorer.exe"), &HSTRING::from(format!("/select,\"{}\"", f.display())), None, SW_SHOWNORMAL);
+    }
+}
+
+fn refresh_list() {
+    let dir = output_dir();
+    let skip = UI.with(|u| u.borrow().rec.as_ref().map(|r| r.2.clone()));
+    let list = recs::scan(&dir, skip.as_deref());
+    let free = recs::free_bytes(&dir);
+    UI.with(|u| {
+        let mut u = u.borrow_mut();
+        u.list = list;
+        u.free = free;
+        u.list_off = u.list_off.min(u.list.len().saturating_sub(LVIS));
+    });
+}
+
+/// フォルダーを選ぶダイアログ
+fn pick_folder(owner: HWND, start: &str) -> Option<PathBuf> {
+    use windows::Win32::System::Com::{CoCreateInstance, CoTaskMemFree, CLSCTX_INPROC_SERVER};
+    use windows::Win32::UI::Shell::{FileOpenDialog, IFileOpenDialog, IShellItem, SHCreateItemFromParsingName, FOS_FORCEFILESYSTEM, FOS_PICKFOLDERS, SIGDN_FILESYSPATH};
+    unsafe {
+        let d: IFileOpenDialog = CoCreateInstance(&FileOpenDialog, None, CLSCTX_INPROC_SERVER).ok()?;
+        let o = d.GetOptions().ok()?;
+        d.SetOptions(o | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM).ok()?;
+        let _ = d.SetTitle(w!("録画の保存先を選択"));
+        if let Ok(item) = SHCreateItemFromParsingName::<_, _, IShellItem>(&HSTRING::from(start), None) {
+            let _ = d.SetFolder(&item);
+        }
+        d.Show(Some(owner)).ok()?;
+        let r = d.GetResult().ok()?;
+        let name = r.GetDisplayName(SIGDN_FILESYSPATH).ok()?;
+        let s = name.to_string().ok();
+        CoTaskMemFree(Some(name.0 as _));
+        s.map(PathBuf::from)
+    }
+}
+
+// ---- ショートカット ----
+
+fn hotkey_reg(hwnd: HWND, hk: (u32, u32)) -> bool {
+    unsafe {
+        let _ = UnregisterHotKey(Some(hwnd), HOTKEY);
+        RegisterHotKey(Some(hwnd), HOTKEY, HOT_KEY_MODIFIERS(hk.0) | MOD_NOREPEAT, hk.1).is_ok()
+    }
+}
+
+fn start_capture() {
+    let hwnd = UI.with(|u| {
+        let mut u = u.borrow_mut();
+        u.capturing = true;
+        u.note = None;
+        u.hwnd
+    });
+    // 入力待ちのあいだに、いまのキーが録画を始めてしまわないよう外しておく
+    unsafe { let _ = UnregisterHotKey(Some(hwnd), HOTKEY); }
+}
+
+/// 入力待ちをやめて、いまのショートカットを登録し直す
+fn cancel_capture() {
+    if !UI.with(|u| u.borrow().capturing) {
+        return;
+    }
+    let (hwnd, hk) = UI.with(|u| (u.borrow().hwnd, u.borrow().hotkey));
+    let ok = hotkey_reg(hwnd, hk);
+    UI.with(|u| {
+        let mut u = u.borrow_mut();
+        u.capturing = false;
+        u.hotkey_ok = ok;
     });
     invalidate_main();
+}
+
+fn apply_hotkey(hk: (u32, u32)) {
+    let (hwnd, old) = UI.with(|u| (u.borrow().hwnd, u.borrow().hotkey));
+    if hotkey_reg(hwnd, hk) {
+        UI.with(|u| {
+            let mut u = u.borrow_mut();
+            u.hotkey = hk;
+            u.hotkey_ok = true;
+            u.capturing = false;
+            u.note = Some(format!("{} に変更しました", key_text(hk)));
+        });
+        save_config();
+    } else {
+        let ok = hotkey_reg(hwnd, old);
+        UI.with(|u| {
+            let mut u = u.borrow_mut();
+            u.hotkey_ok = ok;
+            u.capturing = false;
+            u.note = Some("そのキーはほかのアプリが使っています".into());
+        });
+    }
+    invalidate_main();
+}
+
+/// 入力待ちのとき、押されたキーをショートカットにする。処理したら true
+fn capture_key(vk: u32) -> bool {
+    if !UI.with(|u| u.borrow().capturing) {
+        return false;
+    }
+    // 修飾キーだけでは決めない
+    if matches!(vk, 0x10 | 0x11 | 0x12 | 0x5B | 0x5C | 0xA0..=0xA5) {
+        return true;
+    }
+    if vk == VK_ESCAPE.0 as u32 {
+        cancel_capture();
+        return true;
+    }
+    let down = |k: VIRTUAL_KEY| unsafe { GetKeyState(k.0 as i32) } < 0;
+    let mut mods = 0u32;
+    if down(VK_CONTROL) { mods |= MOD_CONTROL.0; }
+    if down(VK_MENU) { mods |= MOD_ALT.0; }
+    if down(VK_SHIFT) { mods |= MOD_SHIFT.0; }
+    if down(VK_LWIN) || down(VK_RWIN) { mods |= MOD_WIN.0; }
+    if mods == 0 && !(0x70..=0x87).contains(&vk) {
+        UI.with(|u| u.borrow_mut().note = Some("Ctrl・Alt・Shift のどれかと組み合わせてください（F1〜F24 は単独で使えます）".into()));
+        invalidate_main();
+        return true;
+    }
+    apply_hotkey((mods, vk));
+    true
 }
 
 fn open_folder() {
@@ -1557,9 +2314,20 @@ fn set_value(c: Ctl, v: usize) {
             Ctl::Res => u.res = v,
             Ctl::Codec => u.codec = v,
             Ctl::Sys => u.sys = v,
+            Ctl::Tab => {
+                u.tab = TABS[v];
+                u.hover = None;
+                u.note = None;
+            }
             _ => {}
         }
     });
+    if c == Ctl::Tab {
+        cancel_capture();
+        if UI.with(|u| u.borrow().tab) != Tab::Rec {
+            refresh_list();
+        }
+    }
     save_and_repaint();
 }
 
@@ -1612,6 +2380,67 @@ fn activate(h: Hit) {
             save_and_repaint();
         }
         Ctl::Apps => open_picker(),
+        Ctl::SetDir => {
+            let (hwnd, cur) = UI.with(|u| (u.borrow().hwnd, u.borrow().out_dir.clone()));
+            if let Some(d) = pick_folder(hwnd, &cur) {
+                UI.with(|u| {
+                    let mut u = u.borrow_mut();
+                    u.out_dir = d.display().to_string();
+                    u.list_off = 0;
+                    u.note = None;
+                });
+                refresh_list();
+            }
+            save_and_repaint();
+        }
+        Ctl::SetDirOpen => {
+            let dir = output_dir();
+            let _ = std::fs::create_dir_all(&dir);
+            open_path(&dir);
+        }
+        Ctl::SetKey => {
+            if UI.with(|u| u.borrow().capturing) {
+                cancel_capture();
+            } else {
+                start_capture();
+            }
+            invalidate_main();
+        }
+        Ctl::SetKeyReset => {
+            cancel_capture();
+            apply_hotkey((0, VK_F9.0 as u32));
+        }
+        Ctl::TogTray => {
+            UI.with(|u| {
+                let mut u = u.borrow_mut();
+                u.tray_close = !u.tray_close;
+            });
+            save_and_repaint();
+        }
+        Ctl::TogNotify => {
+            UI.with(|u| {
+                let mut u = u.borrow_mut();
+                u.notify = !u.notify;
+            });
+            save_and_repaint();
+        }
+        Ctl::ListRefresh => {
+            refresh_list();
+            invalidate_main();
+        }
+        Ctl::ListOpen | Ctl::ListShow | Ctl::ListDel => {
+            let Some(e) = UI.with(|u| u.borrow().list.get(h.idx).map(|e| e.path.clone())) else { return };
+            match h.ctl {
+                Ctl::ListOpen => open_path(&e),
+                Ctl::ListShow => show_in_folder(&e),
+                _ => {
+                    let ok = recs::recycle(&e);
+                    UI.with(|u| u.borrow_mut().note = Some(if ok { "ごみ箱に移動しました".into() } else { "削除できませんでした".into() }));
+                    refresh_list();
+                }
+            }
+            invalidate_main();
+        }
         Ctl::Rec => toggle(),
         Ctl::Folder => open_folder(),
         c => {
@@ -1625,7 +2454,7 @@ fn activate(h: Hit) {
 }
 
 fn on_key(vk: VIRTUAL_KEY) {
-    let (focus, hotkey_ok) = UI.with(|u| (u.borrow().focus, u.borrow().hotkey_ok));
+    let (focus, hotkey_ok, hk) = UI.with(|u| (u.borrow().focus, u.borrow().hotkey_ok, u.borrow().hotkey));
     if vk == VK_TAB {
         let back = unsafe { GetKeyState(VK_SHIFT.0 as i32) } < 0;
         UI.with(|u| {
@@ -1648,7 +2477,8 @@ fn on_key(vk: VIRTUAL_KEY) {
         invalidate_main();
         return;
     }
-    if vk == VK_F9 && !hotkey_ok {
+    // ショートカットが登録できなかったときは、ウィンドウが前面のあいだだけキーで代用する
+    if hk.0 == 0 && vk.0 as u32 == hk.1 && !hotkey_ok {
         toggle();
         return;
     }
@@ -1750,6 +2580,7 @@ fn init_values() {
     let codecs = encoder::available_codecs();
     let codecs = if codecs.is_empty() { vec![Codec::H264] } else { codecs };
     let gpus = d3d::adapter_names();
+    let dflt = default_dir();
     let apps: Vec<String> = cfg(&c, "apps").unwrap_or("").split('|').filter(|a| !a.is_empty()).map(String::from).collect();
     UI.with(|u| {
         let mut u = u.borrow_mut();
@@ -1764,7 +2595,11 @@ fn init_values() {
         u.sys = num("sysmode", num("system", 1)).min(SYS_MODES.len() - 1);
         u.cursor = num("cursor", 1) != 0;
         u.apps = apps.clone();
-        u.out_dir = output_dir().display().to_string();
+        u.out_dir = cfg(&c, "dir").filter(|d| !d.is_empty()).map(String::from).unwrap_or_else(|| dflt.display().to_string());
+        let hk = cfg(&c, "hotkey").and_then(|v| v.split_once(',')).and_then(|(m, k)| Some((m.parse::<u32>().ok()?, k.parse::<u32>().ok()?)));
+        u.hotkey = hk.filter(|h| h.1 != 0).unwrap_or((0, VK_F9.0 as u32));
+        u.tray_close = num("tray_close", 1) != 0;
+        u.notify = num("notify", 1) != 0;
     });
     refresh_mics(cfg(&c, "mic").filter(|s| !s.is_empty()).map(String::from));
     if !apps.is_empty() {
@@ -1773,19 +2608,165 @@ fn init_values() {
     }
 }
 
+// ---- タスクトレー ----
+
+static TB_MSG: AtomicU32 = AtomicU32::new(0);
+static HINTED: AtomicBool = AtomicBool::new(false);
+
+fn show_window() {
+    let h = UI.with(|u| u.borrow().hwnd);
+    unsafe {
+        let _ = ShowWindow(h, SW_SHOW);
+        let _ = ShowWindow(h, SW_RESTORE);
+        let _ = SetForegroundWindow(h);
+    }
+    invalidate_main();
+}
+
+fn esc(s: &str) -> String {
+    s.replace('&', "&&")
+}
+
+fn tray_menu() {
+    let hwnd = UI.with(|u| u.borrow().hwnd);
+    if UI.with(|u| u.borrow().list.is_empty()) || UI.with(|u| u.borrow().status != Status::Recording) {
+        refresh_list();
+    }
+    let idle = !recording_now();
+    if idle {
+        refresh_sources(&[selected_source_name()]);
+    }
+    let items = UI.with(|u| {
+        use tray::Item;
+        let u = u.borrow();
+        let rec = u.status == Status::Recording;
+        let busy = matches!(u.status, Status::Starting | Status::Saving);
+        let hk = if u.hotkey_ok { format!("\t{}", key_text(u.hotkey)) } else { String::new() };
+        let mut v = vec![
+            Item::cmd(1, format!("{}{hk}", if rec { "録画を停止" } else { "録画を開始" })).on(!busy),
+            Item::cmd(2, "ウィンドウを開く"),
+            Item::Sep,
+        ];
+        let recent: Vec<Item> = if u.list.is_empty() {
+            vec![Item::cmd(0, "（まだありません）").on(false)]
+        } else {
+            u.list.iter().take(6).enumerate().map(|(i, e)| Item::cmd(100 + i as u32, esc(&e.name))).collect()
+        };
+        v.push(Item::sub("最近の録画", recent));
+        v.push(Item::cmd(3, "録画一覧を開く"));
+        v.push(Item::cmd(4, "保存先のフォルダーを開く"));
+        v.push(Item::Sep);
+        let srcs: Vec<Item> = u
+            .sources
+            .iter()
+            .enumerate()
+            .take(60)
+            .map(|(i, s)| Item::cmd(200 + i as u32, esc(display_name(&s.name))).checked(i == u.src).on(idle))
+            .collect();
+        v.push(Item::sub("録画対象", srcs).on(idle));
+        let seg = |c: Ctl, base: u32, cur: usize| -> Vec<Item> {
+            seg_labels(&u, c).iter().enumerate().map(|(i, l)| Item::cmd(base + i as u32, l.to_string()).checked(i == cur).on(idle)).collect()
+        };
+        let settings = vec![
+            Item::sub("画質", seg(Ctl::Quality, 300, u.quality)),
+            Item::sub("フレームレート", seg(Ctl::Fps, 400, u.fps)),
+            Item::sub("解像度", seg(Ctl::Res, 500, u.res)),
+            Item::cmd(600, "カーソルを録画に含める").checked(u.cursor).on(idle),
+        ];
+        v.push(Item::sub("録画の設定", settings).on(idle));
+        let mut mic = vec![Item::cmd(720, "なし").checked(u.mic == 0).on(idle)];
+        mic.extend(u.mics.iter().enumerate().take(30).map(|(i, m)| Item::cmd(721 + i as u32, esc(&m.1)).checked(u.mic == i + 1).on(idle)));
+        let audio = vec![Item::sub("PC の音", seg(Ctl::Sys, 710, u.sys)), Item::sub("マイク", mic)];
+        v.push(Item::sub("音声", audio).on(idle));
+        v.push(Item::Sep);
+        v.push(Item::cmd(800, "トレーから通知する").checked(u.notify));
+        v.push(Item::cmd(801, "×で閉じたらトレーに残す").checked(u.tray_close));
+        v.push(Item::Sep);
+        v.push(Item::cmd(900, "終了"));
+        v
+    });
+    let Some(id) = tray::popup(hwnd, &items) else { return };
+    tray_cmd(hwnd, id);
+}
+
+fn tray_cmd(hwnd: HWND, id: u32) {
+    match id {
+        1 => toggle(),
+        2 => show_window(),
+        3 => {
+            show_window();
+            set_value(Ctl::Tab, 1);
+        }
+        4 => {
+            let dir = output_dir();
+            let _ = std::fs::create_dir_all(&dir);
+            open_path(&dir);
+        }
+        100..=105 => {
+            if let Some(f) = UI.with(|u| u.borrow().list.get((id - 100) as usize).map(|e| e.path.clone())) {
+                open_path(&f);
+            }
+        }
+        200..=299 => UI.with(|u| {
+            let mut u = u.borrow_mut();
+            let i = (id - 200) as usize;
+            if i < u.sources.len() {
+                u.src = i;
+                u.preferred = u.sources.get(i).map(|s| s.name.clone());
+            }
+            drop(u);
+            save_and_repaint();
+        }),
+        300..=399 => set_value(Ctl::Quality, (id - 300) as usize),
+        400..=499 => set_value(Ctl::Fps, (id - 400) as usize),
+        500..=599 => set_value(Ctl::Res, (id - 500) as usize),
+        600 => activate(Hit { ctl: Ctl::Cursor, idx: 0 }),
+        710..=719 => {
+            let i = (id - 710) as usize;
+            set_value(Ctl::Sys, i);
+            // アプリが未選択なら、選ぶ画面のあるウィンドウを出す
+            if i == SYS_APPS && UI.with(|u| u.borrow().apps.is_empty()) {
+                show_window();
+            }
+        }
+        720..=799 => {
+            UI.with(|u| u.borrow_mut().mic = (id - 720) as usize);
+            save_and_repaint();
+        }
+        800 => activate(Hit { ctl: Ctl::TogNotify, idx: 0 }),
+        801 => activate(Hit { ctl: Ctl::TogTray, idx: 0 }),
+        900 => quit(hwnd),
+        _ => {}
+    }
+}
+
+/// 録画を止めて保存し、トレーのアイコンを消して終わる
+fn quit(hwnd: HWND) {
+    tray::remove(hwnd);
+    stop_recording();
+    save_config();
+    unsafe { let _ = DestroyWindow(hwnd); }
+}
+
 extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     let dpi = || UI.with(|u| u.borrow().dpi);
     match msg {
         WM_CREATE => {
             let d = unsafe { GetDpiForWindow(hwnd) }.max(96);
-            let ok = unsafe { RegisterHotKey(Some(hwnd), HOTKEY, MOD_NOREPEAT, VK_F9.0 as u32).is_ok() };
             UI.with(|u| {
                 let mut u = u.borrow_mut();
                 u.hwnd = hwnd;
                 u.dpi = d;
-                u.hotkey_ok = ok;
             });
             init_values();
+            let hk = UI.with(|u| u.borrow().hotkey);
+            let ok = hotkey_reg(hwnd, hk);
+            UI.with(|u| {
+                let mut u = u.borrow_mut();
+                u.hotkey_ok = ok;
+                u.tray_on = true;
+            });
+            tray::add(hwnd, TIP);
             LRESULT(0)
         }
         WM_PAINT => {
@@ -1876,12 +2857,67 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
             invalidate_main();
             LRESULT(0)
         }
-        WM_KEYDOWN => {
-            on_key(VIRTUAL_KEY(wp.0 as u16));
+        WM_MOUSEWHEEL => {
+            let delta = (wp.0 >> 16) as u16 as i16 as i32;
+            let moved = UI.with(|u| {
+                let mut u = u.borrow_mut();
+                if u.tab != Tab::List || u.list.len() <= LVIS {
+                    return false;
+                }
+                let max = u.list.len() - LVIS;
+                let old = u.list_off;
+                u.list_off = if delta > 0 { old.saturating_sub(1) } else { (old + 1).min(max) };
+                u.hover = None;
+                u.list_off != old
+            });
+            if moved {
+                invalidate_main();
+            }
+            LRESULT(0)
+        }
+        WM_KEYDOWN | WM_SYSKEYDOWN => {
+            if !capture_key(wp.0 as u32) && msg == WM_KEYDOWN {
+                on_key(VIRTUAL_KEY(wp.0 as u16));
+            } else if !UI.with(|u| u.borrow().capturing) && msg == WM_SYSKEYDOWN {
+                return unsafe { DefWindowProcW(hwnd, msg, wp, lp) };
+            }
             LRESULT(0)
         }
         WM_ACTIVATEAPP if wp.0 == 0 => {
             pop_finish(None);
+            cancel_capture();
+            LRESULT(0)
+        }
+        WM_SHOWME => {
+            show_window();
+            LRESULT(0)
+        }
+        m if m == tray::WM_TRAY => {
+            match (lp.0 & 0xffff) as u32 {
+                WM_LBUTTONUP | WM_LBUTTONDBLCLK => show_window(),
+                WM_RBUTTONUP | WM_CONTEXTMENU => tray_menu(),
+                // 通知を押したら保存先を開く
+                x if x == WM_USER + 5 => {
+                    let dir = output_dir();
+                    open_path(&dir);
+                }
+                _ => {}
+            }
+            LRESULT(0)
+        }
+        m if m != 0 && m == TB_MSG.load(Ordering::Relaxed) => {
+            // エクスプローラーが再起動したら、トレーのアイコンを付け直す
+            tray::add(hwnd, TIP);
+            update_tray(true);
+            LRESULT(0)
+        }
+        WM_QUERYENDSESSION => LRESULT(1),
+        WM_ENDSESSION => {
+            if wp.0 != 0 {
+                tray::remove(hwnd);
+                stop_recording();
+                save_config();
+            }
             LRESULT(0)
         }
         WM_HOTKEY if wp.0 as i32 == HOTKEY => {
@@ -1891,13 +2927,27 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
             LRESULT(0)
         }
         WM_TIMER => {
-            tick();
+            if wp.0 == METER {
+                meter_tick();
+            } else {
+                tick();
+            }
             LRESULT(0)
         }
         WM_CLOSE => {
-            stop_recording();
-            save_config();
-            unsafe { let _ = DestroyWindow(hwnd); }
+            let to_tray = UI.with(|u| u.borrow().tray_close && u.borrow().tray_on);
+            if to_tray {
+                pop_finish(None);
+                cancel_capture();
+                close_picker();
+                unsafe { let _ = ShowWindow(hwnd, SW_HIDE); }
+                // 初めて隠したときだけ、残っていることと終わらせ方を知らせる
+                if !HINTED.swap(true, Ordering::Relaxed) {
+                    tray::balloon(hwnd, "LightCaptureX はトレーで動いています", "終了するには、トレーのアイコンを右クリックして「終了」を選んでください");
+                }
+            } else {
+                quit(hwnd);
+            }
             LRESULT(0)
         }
         WM_DESTROY => {
@@ -1932,6 +2982,18 @@ fn register(name: PCWSTR, proc_: WNDPROC, style: WNDCLASS_STYLES, bg: C, icon: b
 }
 
 pub fn run() {
+    unsafe {
+        // すでに起動していたら、そのウィンドウを出して終わる
+        let m = windows::Win32::System::Threading::CreateMutexW(None, true, w!("Local\\LightCaptureX.single"));
+        if m.is_ok() && GetLastError() == ERROR_ALREADY_EXISTS {
+            if let Ok(h) = FindWindowW(w!("LightCaptureX"), None) {
+                let _ = PostMessageW(Some(h), WM_SHOWME, WPARAM(0), LPARAM(0));
+            }
+            return;
+        }
+        TB_MSG.store(RegisterWindowMessageW(w!("TaskbarCreated")), Ordering::Relaxed);
+    }
+    tray::dark_menus();
     register(w!("LightCaptureX"), Some(wndproc), WNDCLASS_STYLES(0), tok::BG, true);
     register(w!("LightCaptureXPopup"), Some(pop_proc), CS_DROPSHADOW, tok::CTRL, false);
     register(w!("LightCaptureXPicker"), Some(pick_proc), WNDCLASS_STYLES(0), tok::BG, true);
@@ -1983,6 +3045,17 @@ pub fn render_ui(dir: &str) {
     let demo_apps = vec!["VALORANT-Win64-Shipping.exe".to_string(), "Discord.exe".to_string()];
     let entries = apps::gather(&demo_apps, 64);
     remember_icons(&entries);
+    // 実際のフォルダーは読まず、見本の一覧と保存先を使う
+    let demo_list: Vec<RecEntry> = (0..9)
+        .map(|i| RecEntry {
+            path: PathBuf::from(format!("C:\\Videos\\LightCaptureX\\LightCaptureX_20261020_{:02}0000.mp4", 22 - i)),
+            name: format!("LightCaptureX_20261020_{:02}0000.mp4", 22 - i),
+            size: 900_000_000 / (i as u64 + 1),
+            secs: if i == 3 { None } else { Some(2400 / (i as u64 + 1)) },
+            when: (2026, 10, 20, 22 - i as u16, 0),
+        })
+        .collect();
+    let demo_dir = "D:\\Recordings\\Games\\LightCaptureX".to_string();
 
     type Setup = Box<dyn Fn(&mut Ui)>;
     let scenes: Vec<(&str, Setup, Option<Ctl>)> = vec![
@@ -2017,6 +3090,32 @@ pub fn render_ui(dir: &str) {
             }),
             None,
         ),
+        (
+            "live",
+            Box::new(|u| {
+                u.status = Status::Recording;
+                u.elapsed = 754;
+                u.size_mb = 312.4;
+                u.blink = true;
+                u.info = "（エンコーダの表示）".into();
+                u.fps_now = 59.0;
+                u.dropped = 3;
+                u.mbps = 24.6;
+                u.cpu = Some(18);
+                u.gpu_load = Some(47);
+                u.fps_hist = (0..90).map(|i| if i == 40 || i == 41 { 44.0 } else { 58.0 + ((i * 7) % 5) as f32 * 0.5 }).collect();
+                u.meter = [0.72, 0.38];
+                u.hold = [0.85, 0.52];
+                u.mic = 1.min(u.mics.len());
+            }),
+            None,
+        ),
+        ("list", Box::new(|u| u.tab = Tab::List), None),
+        ("list-hover", Box::new(|u| { u.tab = Tab::List; u.hover = Some(Hit { ctl: Ctl::ListDel, idx: 1 }); u.list_off = 0; }), None),
+        ("list-empty", Box::new(|u| { u.tab = Tab::List; u.list.clear(); }), None),
+        ("settings", Box::new(|u| u.tab = Tab::Set), None),
+        ("settings-capture", Box::new(|u| { u.tab = Tab::Set; u.capturing = true; u.hover = Some(Hit { ctl: Ctl::SetKey, idx: 0 }); }), None),
+        ("settings-note", Box::new(|u| { u.tab = Tab::Set; u.tray_close = false; u.note = Some("そのキーはほかのアプリが使っています".into()); u.hotkey = (MOD_CONTROL.0 | MOD_SHIFT.0, 0x52); }), None),
         ("starting", Box::new(|u| u.status = Status::Starting), None),
         (
             "error",
@@ -2042,6 +3141,21 @@ pub fn render_ui(dir: &str) {
                 u.sys = base_sys;
                 u.apps = base_apps.clone();
                 u.open = *open;
+                u.tab = Tab::Rec;
+                u.capturing = false;
+                u.note = None;
+                u.tray_close = true;
+                u.hotkey = (0, VK_F9.0 as u32);
+                u.out_dir = demo_dir.clone();
+                u.free = Some(412_000_000_000);
+                u.list = demo_list.clone();
+                u.list_off = 0;
+                u.fps_hist.clear();
+                u.meter = [0.0; 2];
+                u.hold = [0.0; 2];
+                u.dropped = 0;
+                u.cpu = None;
+                u.gpu_load = None;
                 setup(&mut u);
             });
             let pop = open.map(|c| {

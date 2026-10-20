@@ -338,9 +338,12 @@ pub fn run(enc: Arc<Mutex<Encoder>>, t0: i64, system: bool, apps: Vec<String>, m
             mix.resize(n * CH, 0.0);
             for i in inputs.iter_mut() {
                 let take = (n * CH).min(i.ring.len());
+                let mut peak = 0f32;
                 for (m, s) in mix.iter_mut().zip(i.ring.drain(..take)) {
                     *m += s;
+                    peak = peak.max(s.abs());
                 }
+                crate::stats::push_peak(i.name == "mic", peak);
                 // 届くのが遅れ続けて溜まりすぎた分は捨てる
                 let max = (LATENCY as usize * 3) * CH;
                 if i.ring.len() > max {
