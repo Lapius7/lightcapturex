@@ -114,7 +114,7 @@ fn uninstall(silent: bool) {
     let _ = std::fs::remove_file(dir.join("lightcapturex.exe.old"));
     // 実行中の自分自身は消せないので、終了後にコマンドで片付ける
     let cmd = format!("ping -n 3 127.0.0.1 >nul & del /f /q \"{0}\\uninstall.exe\" & rmdir \"{0}\"", dir.display());
-    let _ = std::process::Command::new("cmd").args(["/c", &cmd]).creation_flags(CREATE_NO_WINDOW).spawn();
+    let _ = std::process::Command::new("cmd").raw_arg(format!("/c {cmd}")).creation_flags(CREATE_NO_WINDOW).spawn();
     if !silent {
         msg("削除しました。", MB_OK | MB_ICONINFORMATION);
     }
