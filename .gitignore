@@ -1,3 +1,4 @@
 /target
 *.mp4
 .yomiyasu/
+/installer/target

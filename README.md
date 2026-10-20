@@ -31,7 +31,12 @@ Capture, color conversion, scaling and encoding all run on the GPU, so it barely
 
 ## Download
 
-Get `lightcapturex.exe` from the [latest release](https://github.com/Lapius7/lightcapturex/releases/latest) and run it. It checks for updates by itself.
+From the [latest release](https://github.com/Lapius7/lightcapturex/releases/latest), get either of these:
+
+- `lightcapturex-installer-vX.Y.Z.exe`: installer. Installs per user (no admin rights needed), adds a Start menu shortcut and an uninstall entry in Windows Settings.
+- `lightcapturex.exe`: the app alone. Just run it.
+
+Either way, the app checks for updates by itself.
 
 ## Usage
 
@@ -69,6 +74,15 @@ cargo build --release
 ```
 
 The output is `target/x86_64-pc-windows-gnu/release/lightcapturex.exe`.
+
+To build the installer (it embeds the exe above, so build the app first):
+
+```
+cd installer
+cargo build --release --target x86_64-pc-windows-gnu
+```
+
+The output is `installer/target/x86_64-pc-windows-gnu/release/lightcapturex-installer.exe`. Rename it to `lightcapturex-installer-vX.Y.Z.exe` for release.
 
 ## License
 
