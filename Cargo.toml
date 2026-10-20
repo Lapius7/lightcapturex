@@ -1,6 +1,6 @@
 [package]
 name = "lightcapturex"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2021"
 description = "Ultra-lightweight game recorder for Windows (WGC + Media Foundation hardware encoding)"
 license = "MIT"
