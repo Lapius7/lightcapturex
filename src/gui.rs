@@ -34,7 +34,7 @@ const WM_SHOWME: u32 = WM_APP + 2;
 static ANNOUNCED: AtomicBool = AtomicBool::new(false);
 
 const QUALITIES: [&str; 4] = ["低", "中", "高", "最高"];
-const FPS: [u32; 2] = [30, 60];
+const FPS: [u32; 5] = [30, 60, 120, 144, 240];
 const RES: [(&str, u32); 4] = [("元のまま", 0), ("1080p", 1080), ("720p", 720), ("480p", 480)];
 const SYS_MODES: [&str; 3] = ["なし", "すべて", "アプリ"];
 const SYS_APPS: usize = 2;
@@ -3290,7 +3290,8 @@ pub fn render_ui(dir: &str) {
             Box::new(|u| {
                 u.status = Status::Recording;
                 u.elapsed = 754;
-                u.size_mb = 312.4;
+                u.size_mb = 1284.6;
+                u.fps = 3;
                 u.blink = true;
                 u.info = "GeForce RTX 4070 / H.264 Encoder".into();
                 u.hover = Some(Hit { ctl: Ctl::Rec, idx: 0 });
@@ -3302,15 +3303,16 @@ pub fn render_ui(dir: &str) {
             Box::new(|u| {
                 u.status = Status::Recording;
                 u.elapsed = 754;
-                u.size_mb = 312.4;
+                u.size_mb = 1284.6;
+                u.fps = 3;
                 u.blink = true;
                 u.info = "GeForce RTX 4070 / H.264 Encoder".into();
-                u.fps_now = 59.0;
-                u.dropped = 3;
-                u.mbps = 24.6;
-                u.cpu = Some(18);
-                u.gpu_load = Some(47);
-                u.fps_hist = (0..90).map(|i| if i == 40 || i == 41 { 44.0 } else { 58.0 + ((i * 7) % 5) as f32 * 0.5 }).collect();
+                u.fps_now = 144.0;
+                u.dropped = 0;
+                u.mbps = 48.2;
+                u.cpu = Some(4);
+                u.gpu_load = Some(12);
+                u.fps_hist = (0..90).map(|i| 143.0 + ((i * 7) % 5) as f32 * 0.4).collect();
                 u.meter = [0.72, 0.38];
                 u.hold = [0.85, 0.52];
             }),

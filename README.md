@@ -25,7 +25,7 @@ Capture, color conversion, scaling and encoding all run on the GPU, so it barely
 - Record a monitor or a single window (Windows.Graphics.Capture)
 - Hardware encoding: H.264 / HEVC / AV1 (NVENC, Quick Sync, AMF via Media Foundation)
 - GPU selection: automatic (the GPU driving the captured monitor) or manual; falls back to another GPU if the chosen one can't encode
-- Quality (4 levels), 30/60 fps, output resolution (source / 1080p / 720p / 480p)
+- Quality (4 levels), 30 / 60 / 120 / 144 / 240 fps, output resolution (source / 1080p / 720p / 480p)
 - Audio mixed into one track:
   - PC sound: off / everything / **selected apps only** (e.g. only VALORANT + Discord)
   - Microphone
