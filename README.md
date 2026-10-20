@@ -25,14 +25,14 @@ Capture, color conversion, scaling and encoding all run on the GPU, so it barely
 - Record a monitor or a single window (Windows.Graphics.Capture)
 - Hardware encoding: H.264 / HEVC / AV1 (NVENC, Quick Sync, AMF via Media Foundation)
 - GPU selection: automatic (the GPU driving the captured monitor) or manual; falls back to another GPU if the chosen one can't encode
-- Quality (4 levels), 30 / 60 / 120 / 144 / 240 fps, output resolution (source / 1080p / 720p / 480p)
+- Quality (4 levels), frame rate 15–360 fps (slider), output resolution (source / 1080p / 720p / 480p)
 - Audio mixed into one track:
   - PC sound: off / everything / **selected apps only** (e.g. only VALORANT + Discord)
   - Microphone
 - Global hotkey to start/stop (default **F9**, changeable in the settings tab)
 - Live stats while recording: elapsed time, file size, real fps, dropped frames, audio level meters, CPU/GPU usage
 - Recordings tab: list, play, show in folder, delete
-- Changeable save folder and target bitrate (auto or 6–100 Mbps)
+- Changeable save folder and target bitrate (auto or 1–150 Mbps (slider))
 - Live preview of each capture target in the picker; thumbnails in the recordings list
 - Auto update: checks GitHub Releases at startup and replaces the exe in place when you click Update
 - Tray icon: closing the window hides it to the tray; the icon blinks red while recording; menu for start/stop, recent recordings and quick settings; optional notifications

@@ -34,7 +34,15 @@ const WM_SHOWME: u32 = WM_APP + 2;
 static ANNOUNCED: AtomicBool = AtomicBool::new(false);
 
 const QUALITIES: [&str; 4] = ["低", "中", "高", "最高"];
-const FPS: [u32; 5] = [30, 60, 120, 144, 240];
+/// フレームレートのスライダーが吸い付く値（トレーのメニューにも使う）
+const FPS_PRESETS: [u32; 5] = [30, 60, 120, 144, 240];
+const FPS_MIN: u32 = 15;
+const FPS_MAX: u32 = 360;
+/// ビットレートの上限（Mbps）。0 は「自動」
+const BR_MAX: u32 = 150;
+/// 旧設定（fps=番号）の番号が指していた値
+const FPS_LEGACY: [u32; 5] = [30, 60, 120, 144, 240];
+const BR_LEGACY: [u32; 9] = [0, 6, 10, 16, 24, 35, 50, 80, 100];
 const RES: [(&str, u32); 4] = [("元のまま", 0), ("1080p", 1080), ("720p", 720), ("480p", 480)];
 const SYS_MODES: [&str; 3] = ["なし", "すべて", "アプリ"];
 const SYS_APPS: usize = 2;
@@ -138,7 +146,7 @@ struct Ui {
     /// 0 は「自動」
     gpu: usize,
     quality: usize,
-    fps: usize,
+    fps: u32,
     res: usize,
     sys: usize,
     cursor: bool,
@@ -165,8 +173,10 @@ struct Ui {
     tray_close: bool,
     notify: bool,
     auto_update: bool,
-    /// BITRATES の何番目か（0 は自動）
-    bitrate: usize,
+    /// 目標ビットレート（Mbps）。0 は自動
+    bitrate: u32,
+    /// つまみをドラッグしている部品
+    drag: Option<Ctl>,
     tray_on: bool,
     list: Vec<RecEntry>,
     /// 録画ファイルのサムネイル（パスごと）と、作成中のパス
@@ -233,7 +243,6 @@ const LIST: R = R::new(PAD, 96.0, W - PAD * 2.0, 392.0);
 const LROW: f32 = 56.0;
 const LVIS: usize = 7;
 /// ビットレート（Mbps）。0 は画質から自動で決める
-const BITRATES: [u32; 9] = [0, 6, 10, 16, 24, 35, 50, 80, 100];
 const LABEL_V: f32 = 112.0;
 const LABEL_A: f32 = 72.0;
 
@@ -291,13 +300,12 @@ fn segs(r: R, n: usize) -> impl Iterator<Item = R> {
 }
 
 fn is_seg(c: Ctl) -> bool {
-    matches!(c, Ctl::Quality | Ctl::Fps | Ctl::Res | Ctl::Codec | Ctl::Sys | Ctl::Tab)
+    matches!(c, Ctl::Quality | Ctl::Res | Ctl::Codec | Ctl::Sys | Ctl::Tab)
 }
 
 fn seg_labels(u: &Ui, c: Ctl) -> Vec<String> {
     match c {
         Ctl::Quality => QUALITIES.map(String::from).to_vec(),
-        Ctl::Fps => FPS.map(|f| f.to_string()).to_vec(),
         Ctl::Res => RES.map(|r| r.0.to_string()).to_vec(),
         Ctl::Codec => u.codecs.iter().map(|c| c.label().to_string()).collect(),
         Ctl::Sys => SYS_MODES.map(String::from).to_vec(),
@@ -309,7 +317,6 @@ fn seg_labels(u: &Ui, c: Ctl) -> Vec<String> {
 fn seg_value(u: &Ui, c: Ctl) -> usize {
     match c {
         Ctl::Quality => u.quality,
-        Ctl::Fps => u.fps,
         Ctl::Res => u.res,
         Ctl::Codec => u.codec,
         Ctl::Sys => u.sys,
@@ -572,10 +579,104 @@ fn draw_source(u: &Ui, p: &Painter) {
     p.text(display_name(&info.name), R::new(x, r.y, r.right() - x, r.h), Font::strong(13.0), fg);
 }
 
-fn bitrate_text(i: usize) -> String {
-    match BITRATES[i.min(BITRATES.len() - 1)] {
-        0 => "自動（画質に合わせる）".to_string(),
+fn bitrate_text(m: u32) -> String {
+    match m {
+        0 => "自動".to_string(),
         m => format!("{m} Mbps"),
+    }
+}
+
+fn is_slider(c: Ctl) -> bool {
+    matches!(c, Ctl::Fps | Ctl::Bitrate)
+}
+
+/// 値の範囲（両端を含む）
+fn slider_range(c: Ctl) -> (u32, u32) {
+    match c {
+        Ctl::Fps => (FPS_MIN, FPS_MAX),
+        _ => (0, BR_MAX),
+    }
+}
+
+fn slider_value(u: &Ui, c: Ctl) -> u32 {
+    match c {
+        Ctl::Fps => u.fps,
+        _ => u.bitrate,
+    }
+}
+
+/// つまみの動く線の範囲。右端は数値の表示に空ける
+fn slider_track(c: Ctl) -> R {
+    let r = ctl_rect(c);
+    R::new(r.x + 4.0, r.y, r.w - 4.0 - 88.0, r.h)
+}
+
+fn slider_text(c: Ctl, v: u32) -> String {
+    match c {
+        Ctl::Fps => format!("{v} fps"),
+        _ => bitrate_text(v),
+    }
+}
+
+/// 画面の x 座標から値を決める。フレームレートは代表値の近くで吸い付く
+fn slider_from_x(c: Ctl, x: f32) -> u32 {
+    let (lo, hi) = slider_range(c);
+    let t = slider_track(c);
+    let k = 7.0;
+    let f = ((x - (t.x + k)) / (t.w - 2.0 * k)).clamp(0.0, 1.0);
+    let v = lo + (f * (hi - lo) as f32).round() as u32;
+    if c == Ctl::Fps {
+        if let Some(&p) = FPS_PRESETS.iter().find(|&&p| p.abs_diff(v) <= 3) {
+            return p;
+        }
+    }
+    v
+}
+
+fn set_slider(c: Ctl, v: u32) {
+    let (lo, hi) = slider_range(c);
+    UI.with(|u| {
+        let mut u = u.borrow_mut();
+        match c {
+            Ctl::Fps => u.fps = v.clamp(lo, hi),
+            _ => u.bitrate = v.clamp(lo, hi),
+        }
+    });
+}
+
+fn draw_slider(u: &Ui, p: &Painter, c: Ctl) {
+    let r = ctl_rect(c);
+    let s = st(u, c, 0);
+    let (lo, hi) = slider_range(c);
+    let v = slider_value(u, c).clamp(lo, hi);
+    let t = slider_track(c);
+    let k = 7.0;
+    let (x0, x1) = (t.x + k, t.right() - k);
+    let cy = r.y + r.h / 2.0;
+    let x_of = |v: u32| x0 + (x1 - x0) * (v - lo) as f32 / (hi - lo) as f32;
+    // 線と、選んだところまでの色
+    p.fill(R::new(x0, cy - 2.0, x1 - x0, 4.0), 2.0, tok::CTRL_HOVER);
+    let kx = x_of(v);
+    let dragging = u.drag == Some(c);
+    let lit = if !s.on { tok::TEXT_3 } else if dragging || s.hover { tok::TEXT } else { tok::TEXT_2 };
+    if kx > x0 {
+        p.fill(R::new(x0, cy - 2.0, kx - x0, 4.0), 2.0, lit);
+    }
+    // 代表値の目盛り（フレームレート）
+    if c == Ctl::Fps {
+        for &m in &FPS_PRESETS {
+            let col = if m <= v { tok::BG } else { tok::TEXT_3 };
+            p.dot(x_of(m), cy, 2.0, col);
+        }
+    }
+    let rad = if dragging { 8.0 } else { 7.0 };
+    if s.on {
+        p.dot(kx, cy, rad + 3.0, tok::HALO);
+    }
+    p.dot(kx, cy, rad, if s.on { tok::TEXT } else { tok::TEXT_3 });
+    p.text(&slider_text(c, v), R::new(t.right() + 8.0, r.y, r.right() - t.right() - 8.0, r.h), Font::strong(13.0).at(Align::Right), if s.on { tok::TEXT } else { tok::TEXT_3 });
+    if s.focus {
+        ring(p, r, tok::R_CTRL);
     }
 }
 
@@ -781,12 +882,13 @@ fn draw_rec_tab(u: &Ui, p: &Painter) {
     for (i, s) in ["画質", "フレームレート", "解像度", "コーデック", "GPU", "ビットレート", "カーソル"].iter().enumerate() {
         label(p, VIDEO, i, LABEL_V, s, on);
     }
-    for c in [Ctl::Quality, Ctl::Fps, Ctl::Res, Ctl::Codec] {
+    for c in [Ctl::Quality, Ctl::Res, Ctl::Codec] {
         draw_seg(u, p, c);
     }
+    draw_slider(u, p, Ctl::Fps);
+    draw_slider(u, p, Ctl::Bitrate);
     let gpu = if u.gpu == 0 { "自動".to_string() } else { u.gpus.get(u.gpu - 1).cloned().unwrap_or_default() };
     draw_text_select(u, p, Ctl::Gpu, &gpu);
-    draw_text_select(u, p, Ctl::Bitrate, &bitrate_text(u.bitrate));
     draw_toggle(u, p);
 
     // 音声
@@ -854,7 +956,7 @@ fn pct(v: Option<u32>) -> (String, &'static str) {
 
 fn draw_live(u: &Ui, p: &Painter) {
     card(p, VIDEO, Some("リアルタイム"));
-    let target = FPS[u.fps.min(FPS.len() - 1)] as f32;
+    let target = u.fps as f32;
     let tw = (VIDEO.w - 32.0 - 16.0) / 3.0;
     let tr = |col: usize, rw: usize| R::new(VIDEO.x + 16.0 + col as f32 * (tw + 8.0), VIDEO.y + 44.0 + rw as f32 * 72.0, tw, 64.0);
     tile(p, tr(0, 0), "ファイルサイズ", &format!("{:.1}", u.size_mb), "MB", false);
@@ -2053,7 +2155,7 @@ fn start_recording() {
         let source = u.sources.get(u.src)?.source;
         Some(Settings {
             source,
-            fps: FPS[u.fps.min(FPS.len() - 1)],
+            fps: u.fps.clamp(FPS_MIN, FPS_MAX),
             quality: u.quality as u32,
             max_height: RES[u.res.min(RES.len() - 1)].1,
             cursor: u.cursor,
@@ -2066,7 +2168,7 @@ fn start_recording() {
             mic: if u.mic == 0 { None } else { u.mics.get(u.mic - 1).map(|x| x.0.clone()) },
             codec: u.codecs.get(u.codec).copied().unwrap_or(Codec::H264),
             gpu: if u.gpu == 0 { None } else { u.gpus.get(u.gpu - 1).cloned() },
-        bitrate_mbps: BITRATES[u.bitrate.min(BITRATES.len() - 1)],
+        bitrate_mbps: u.bitrate.min(BR_MAX),
             path: path.to_string_lossy().into_owned(),
         })
     });
@@ -2456,7 +2558,6 @@ fn set_value(c: Ctl, v: usize) {
         let v = v.min(n - 1);
         match c {
             Ctl::Quality => u.quality = v,
-            Ctl::Fps => u.fps = v,
             Ctl::Res => u.res = v,
             Ctl::Codec => u.codec = v,
             Ctl::Sys => u.sys = v,
@@ -2503,13 +2604,6 @@ fn activate(h: Hit) {
             });
             if let Some(i) = dropdown(Ctl::Gpu, items, sel).filter(|_| UI.with(|u| enabled(&u.borrow(), Ctl::Gpu))) {
                 UI.with(|u| u.borrow_mut().gpu = i);
-            }
-            save_and_repaint();
-        }
-        Ctl::Bitrate => {
-            let (items, sel) = UI.with(|u| (BITRATES.iter().enumerate().map(|(i, _)| (None, bitrate_text(i))).collect::<Vec<_>>(), u.borrow().bitrate));
-            if let Some(i) = dropdown(Ctl::Bitrate, items, sel).filter(|_| UI.with(|u| enabled(&u.borrow(), Ctl::Bitrate))) {
-                UI.with(|u| u.borrow_mut().bitrate = i);
             }
             save_and_repaint();
         }
@@ -2659,14 +2753,20 @@ fn on_key(vk: VIRTUAL_KEY) {
     let Some(c) = focus.filter(|&c| UI.with(|u| enabled(&u.borrow(), c))) else { return };
     UI.with(|u| u.borrow_mut().kb = true);
     if vk == VK_LEFT || vk == VK_RIGHT || vk == VK_UP || vk == VK_DOWN {
-        if is_seg(c) {
+        if is_slider(c) {
+            let v = UI.with(|u| slider_value(&u.borrow(), c));
+            let step = if vk == VK_UP || vk == VK_DOWN { 10 } else { 1 };
+            let v = if vk == VK_LEFT || vk == VK_DOWN { v.saturating_sub(step) } else { v + step };
+            set_slider(c, v);
+            save_config();
+        } else if is_seg(c) {
             let v = UI.with(|u| seg_value(&u.borrow(), c));
             let v = if vk == VK_LEFT || vk == VK_UP { v.saturating_sub(1) } else { v + 1 };
             set_value(c, v);
-        } else if matches!(c, Ctl::Source | Ctl::Gpu | Ctl::Mic | Ctl::Bitrate) && (vk == VK_DOWN || vk == VK_UP) {
+        } else if matches!(c, Ctl::Source | Ctl::Gpu | Ctl::Mic) && (vk == VK_DOWN || vk == VK_UP) {
             activate(Hit { ctl: c, idx: 0 });
         }
-    } else if (vk == VK_SPACE || vk == VK_RETURN) && !is_seg(c) {
+    } else if (vk == VK_SPACE || vk == VK_RETURN) && !is_seg(c) && !is_slider(c) {
         activate(Hit { ctl: c, idx: 0 });
     }
     invalidate_main();
@@ -2759,7 +2859,7 @@ fn init_values() {
     UI.with(|u| {
         let mut u = u.borrow_mut();
         u.quality = num("quality", 2).min(QUALITIES.len() - 1);
-        u.fps = num("fps", 1).min(FPS.len() - 1);
+        u.fps = cfg(&c, "fps").and_then(|v| v.parse::<u32>().ok()).map(|v| if v < 10 { FPS_LEGACY[(v as usize).min(FPS_LEGACY.len() - 1)] } else { v }).unwrap_or(60).clamp(FPS_MIN, FPS_MAX);
         u.res = num("res", 0).min(RES.len() - 1);
         u.codec = cfg(&c, "codec").and_then(|v| codecs.iter().position(|x| x.label() == v)).unwrap_or(0);
         u.gpu = cfg(&c, "gpu").and_then(|v| gpus.iter().position(|x| x == v)).map(|i| i + 1).unwrap_or(0);
@@ -2775,7 +2875,7 @@ fn init_values() {
         u.tray_close = num("tray_close", 1) != 0;
         u.notify = num("notify", 1) != 0;
         u.auto_update = num("auto_update", 1) != 0;
-        u.bitrate = num("bitrate", 0).min(BITRATES.len() - 1);
+        u.bitrate = cfg(&c, "bitrate").and_then(|v| v.parse::<u32>().ok()).map(|v| if v < 9 { BR_LEGACY[v as usize] } else { v }).unwrap_or(0).min(BR_MAX);
     });
     refresh_mics(cfg(&c, "mic").filter(|s| !s.is_empty()).map(String::from));
     if !apps.is_empty() {
@@ -2843,9 +2943,10 @@ fn tray_menu() {
         let seg = |c: Ctl, base: u32, cur: usize| -> Vec<Item> {
             seg_labels(&u, c).iter().enumerate().map(|(i, l)| Item::cmd(base + i as u32, l.to_string()).checked(i == cur).on(idle)).collect()
         };
+        let fps_items: Vec<Item> = FPS_PRESETS.iter().enumerate().map(|(i, f)| Item::cmd(400 + i as u32, f.to_string()).checked(*f == u.fps).on(idle)).collect();
         let settings = vec![
             Item::sub("画質", seg(Ctl::Quality, 300, u.quality)),
-            Item::sub("フレームレート", seg(Ctl::Fps, 400, u.fps)),
+            Item::sub("フレームレート", fps_items),
             Item::sub("解像度", seg(Ctl::Res, 500, u.res)),
             Item::cmd(600, "カーソルを録画に含める").checked(u.cursor).on(idle),
         ];
@@ -2897,7 +2998,10 @@ fn tray_cmd(hwnd: HWND, id: u32) {
             save_and_repaint();
         }),
         300..=399 => set_value(Ctl::Quality, (id - 300) as usize),
-        400..=499 => set_value(Ctl::Fps, (id - 400) as usize),
+        400..=499 => {
+            set_slider(Ctl::Fps, FPS_PRESETS[((id - 400) as usize).min(FPS_PRESETS.len() - 1)]);
+            save_and_repaint();
+        }
         500..=599 => set_value(Ctl::Res, (id - 500) as usize),
         600 => activate(Hit { ctl: Ctl::Cursor, idx: 0 }),
         710..=719 => {
@@ -2980,6 +3084,10 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
         }
         WM_MOUSEMOVE => {
             let (x, y) = pt(lp, dpi());
+            if let Some(c) = UI.with(|u| u.borrow().drag) {
+                set_slider(c, slider_from_x(c, x));
+                invalidate_main();
+            }
             let (changed, track) = UI.with(|u| {
                 let mut u = u.borrow_mut();
                 let h = hit_main(&u, x, y);
@@ -3015,8 +3123,14 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
                 u.kb = false;
                 if let Some(h) = h {
                     u.focus = Some(h.ctl);
+                    if is_slider(h.ctl) {
+                        u.drag = Some(h.ctl);
+                    }
                 }
             });
+            if let Some(c) = UI.with(|u| u.borrow().drag) {
+                set_slider(c, slider_from_x(c, x));
+            }
             unsafe { SetCapture(hwnd) };
             invalidate_main();
             LRESULT(0)
@@ -3024,6 +3138,12 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
         WM_LBUTTONUP => {
             let (x, y) = pt(lp, dpi());
             let pressed = UI.with(|u| u.borrow_mut().press.take());
+            if let Some(c) = UI.with(|u| u.borrow_mut().drag.take()) {
+                set_slider(c, slider_from_x(c, x));
+                unsafe { let _ = ReleaseCapture(); }
+                save_and_repaint();
+                return LRESULT(0);
+            }
             unsafe { let _ = ReleaseCapture(); }
             let now = UI.with(|u| hit_main(&u.borrow(), x, y));
             invalidate_main();
@@ -3033,7 +3153,11 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
             LRESULT(0)
         }
         WM_CAPTURECHANGED => {
-            UI.with(|u| u.borrow_mut().press = None);
+            UI.with(|u| {
+                let mut u = u.borrow_mut();
+                u.press = None;
+                u.drag = None;
+            });
             invalidate_main();
             LRESULT(0)
         }
@@ -3291,7 +3415,7 @@ pub fn render_ui(dir: &str) {
                 u.status = Status::Recording;
                 u.elapsed = 754;
                 u.size_mb = 1284.6;
-                u.fps = 3;
+                u.fps = 144;
                 u.blink = true;
                 u.info = "GeForce RTX 4070 / H.264 Encoder".into();
                 u.hover = Some(Hit { ctl: Ctl::Rec, idx: 0 });
@@ -3304,7 +3428,7 @@ pub fn render_ui(dir: &str) {
                 u.status = Status::Recording;
                 u.elapsed = 754;
                 u.size_mb = 1284.6;
-                u.fps = 3;
+                u.fps = 144;
                 u.blink = true;
                 u.info = "GeForce RTX 4070 / H.264 Encoder".into();
                 u.fps_now = 144.0;
@@ -3366,6 +3490,7 @@ pub fn render_ui(dir: &str) {
                 u.gpu_load = None;
                 u.mics = vec![("demo".into(), "マイク (USB Microphone)".into())];
                 u.mic = 1;
+            u.bitrate = 24;
                 setup(&mut u);
             });
             let pop = open.map(|c| {

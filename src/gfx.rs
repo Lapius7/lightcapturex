@@ -47,6 +47,7 @@ pub mod tok {
     /// 録画中の点滅で消えている側
     pub const REC_DIM: C = C(0.898, 0.282, 0.302, 0.3);
     pub const SEG_ON_HOVER: C = rgb(0x44474D);
+    pub const HALO: C = white(0.14);
     pub const SHADE: C = C(0.0, 0.0, 0.0, 0.45);
 
     pub const R_CARD: f32 = 10.0;
