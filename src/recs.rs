@@ -17,6 +17,10 @@ pub struct RecEntry {
     pub secs: Option<u64>,
     /// 更新日時（ローカル時間）: 年, 月, 日, 時, 分
     pub when: (u16, u16, u16, u16, u16),
+    /// 並べ替え用の更新日時（UNIX 時刻のミリ秒）
+    pub mtime: u64,
+    /// リプレイの保存先にあったもの
+    pub replay: bool,
 }
 
 /// mp4 の moov/mvhd から長さを読む
@@ -103,7 +107,7 @@ pub fn scan(dir: &Path, skip: Option<&Path>) -> Vec<RecEntry> {
             let m = e.metadata().ok().filter(|m| m.is_file())?;
             let t = m.modified().ok()?;
             let name = path.file_name()?.to_string_lossy().into_owned();
-            Some((t, RecEntry { secs: duration(&path), when: local_time(t), size: m.len(), name, path }))
+            Some((t, RecEntry { secs: duration(&path), when: local_time(t), mtime: t.duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64), replay: false, size: m.len(), name, path }))
         })
         .collect();
     v.sort_by(|a, b| b.0.cmp(&a.0));

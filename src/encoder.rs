@@ -68,7 +68,7 @@ pub struct Encoder {
     _manager: IMFDXGIDeviceManager,
     video: u32,
     audio: Option<u32>,
-    frame_dur: i64,
+    fps: u32,
     /// 実際に使われているエンコーダの名前
     pub name: String,
 }
@@ -76,12 +76,18 @@ pub struct Encoder {
 // SinkWriter はフリースレッドなので、録画スレッド間で共有してよい
 unsafe impl Send for Encoder {}
 
-fn pack(a: u32, b: u32) -> u64 {
+/// index 番目のフレームの時刻（100ns 単位）
+pub fn frame_time(index: u64, fps: u32) -> i64 {
+    (index as i128 * 10_000_000 / fps.max(1) as i128) as i64
+}
+
+pub fn pack(a: u32, b: u32) -> u64 {
     ((a as u64) << 32) | b as u64
 }
 
 impl Encoder {
-    pub fn new(path: &str, device: &ID3D11Device, codec: Codec, w: u32, h: u32, fps: u32, bitrate: u32, audio: bool) -> Result<Self> {
+    /// replay: リプレイの区切りファイル用。B フレームを使わず、キーフレームで正確に切り出せるようにする
+    pub fn new(path: &str, device: &ID3D11Device, codec: Codec, w: u32, h: u32, fps: u32, bitrate: u32, audio: bool, replay: bool) -> Result<Self> {
         unsafe {
             let mut token = 0u32;
             let mut manager = None;
@@ -89,15 +95,7 @@ impl Encoder {
             let manager = manager.unwrap();
             manager.ResetDevice(device, token)?;
 
-            let mut attrs = None;
-            MFCreateAttributes(&mut attrs, 4)?;
-            let attrs = attrs.unwrap();
-            attrs.SetUnknown(&MF_SINK_WRITER_D3D_MANAGER, &manager)?;
-            attrs.SetUINT32(&MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS, 1)?;
-    // 書き込みを待たせない（ゲームに合わせて遅れたぶんを取り戻せるように）
-    let _ = attrs.SetUINT32(&MF_SINK_WRITER_DISABLE_THROTTLING, 1);
-            attrs.SetGUID(&MF_TRANSCODE_CONTAINERTYPE, &MFTranscodeContainerType_MPEG4)?;
-            let writer = MFCreateSinkWriterFromURL(&HSTRING::from(path), None, &attrs)?;
+            let writer = mp4_writer(path, Some(&manager))?;
 
             let out = MFCreateMediaType()?;
             out.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;
@@ -124,47 +122,40 @@ impl Encoder {
             inp.SetUINT64(&MF_MT_PIXEL_ASPECT_RATIO, pack(1, 1))?;
             set_color(&inp)?;
             // エンコーダ設定：上限付き VBR（静かな場面で容量を節約）、キーフレームは 2 秒ごと（シークしやすく）
-            let mut params = None;
-            MFCreateAttributes(&mut params, 4)?;
-            let params = params.unwrap();
-            params.SetUINT32(&CODECAPI_AVEncCommonRateControlMode, eAVEncCommonRateControlMode_PeakConstrainedVBR.0 as u32)?;
-            params.SetUINT32(&CODECAPI_AVEncCommonMeanBitRate, bitrate)?;
-            params.SetUINT32(&CODECAPI_AVEncCommonMaxBitRate, bitrate.saturating_mul(3) / 2)?;
-            params.SetUINT32(&CODECAPI_AVEncMPVGOPSize, fps * 2)?;
-            writer.SetInputMediaType(video, &inp, &params).or_else(|_| writer.SetInputMediaType(video, &inp, None))?;
-
-            let audio = if audio {
-                let out = MFCreateMediaType()?;
-                out.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Audio)?;
-                out.SetGUID(&MF_MT_SUBTYPE, &MFAudioFormat_AAC)?;
-                out.SetUINT32(&MF_MT_AUDIO_BITS_PER_SAMPLE, 16)?;
-                out.SetUINT32(&MF_MT_AUDIO_SAMPLES_PER_SECOND, AUDIO_RATE)?;
-                out.SetUINT32(&MF_MT_AUDIO_NUM_CHANNELS, AUDIO_CH)?;
-                // AAC エンコーダが受け付けるのは 12000/16000/20000/24000 (byte/s) のみ。24000 = 192kbps
-                out.SetUINT32(&MF_MT_AUDIO_AVG_BYTES_PER_SECOND, 24_000)?;
-                let idx = writer.AddStream(&out)?;
-
-                let inp = MFCreateMediaType()?;
-                inp.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Audio)?;
-                inp.SetGUID(&MF_MT_SUBTYPE, &MFAudioFormat_PCM)?;
-                inp.SetUINT32(&MF_MT_AUDIO_BITS_PER_SAMPLE, 16)?;
-                inp.SetUINT32(&MF_MT_AUDIO_SAMPLES_PER_SECOND, AUDIO_RATE)?;
-                inp.SetUINT32(&MF_MT_AUDIO_NUM_CHANNELS, AUDIO_CH)?;
-                inp.SetUINT32(&MF_MT_AUDIO_BLOCK_ALIGNMENT, AUDIO_CH * 2)?;
-                inp.SetUINT32(&MF_MT_AUDIO_AVG_BYTES_PER_SECOND, AUDIO_RATE * AUDIO_CH * 2)?;
-                writer.SetInputMediaType(idx, &inp, None)?;
-                Some(idx)
-            } else {
-                None
+            // 受け付けない項目があると全体が失敗するので、項目を減らしながら試す
+            let params = |no_b: bool| -> Result<IMFAttributes> {
+                let mut params = None;
+                MFCreateAttributes(&mut params, 5)?;
+                let params = params.unwrap();
+                params.SetUINT32(&CODECAPI_AVEncCommonRateControlMode, eAVEncCommonRateControlMode_PeakConstrainedVBR.0 as u32)?;
+                params.SetUINT32(&CODECAPI_AVEncCommonMeanBitRate, bitrate)?;
+                params.SetUINT32(&CODECAPI_AVEncCommonMaxBitRate, bitrate.saturating_mul(3) / 2)?;
+                params.SetUINT32(&CODECAPI_AVEncMPVGOPSize, fps * 2)?;
+                if no_b {
+                    params.SetUINT32(&CODECAPI_AVEncMPVDefaultBPictureCount, 0)?;
+                }
+                Ok(params)
             };
+            let mut set = false;
+            for no_b in if replay { &[true, false][..] } else { &[false][..] } {
+                if writer.SetInputMediaType(video, &inp, &params(*no_b)?).is_ok() {
+                    set = true;
+                    break;
+                }
+            }
+            if !set {
+                writer.SetInputMediaType(video, &inp, None)?;
+            }
+
+            let audio = if audio { Some(add_audio(&writer)?) } else { None };
 
             writer.BeginWriting()?;
             let name = encoder_name(&writer, video);
-            Ok(Self { writer, _manager: manager, video, audio, frame_dur: 10_000_000 / fps as i64, name })
+            Ok(Self { writer, _manager: manager, video, audio, fps, name })
         }
     }
 
-    /// index 番目のフレームとして書き込む（タイムスタンプは index × 1 フレーム時間の固定レート）
+    /// index 番目のフレームとして書き込む（タイムスタンプは固定フレームレート。端数を丸めて積み重ねないよう毎回計算する）
     pub fn write_video(&self, tex: &ID3D11Texture2D, index: u64) -> Result<()> {
         unsafe {
             let buf = MFCreateDXGISurfaceBuffer(&ID3D11Texture2D::IID, tex, 0, false)?;
@@ -172,38 +163,100 @@ impl Encoder {
             buf.SetCurrentLength(len)?;
             let sample = MFCreateSample()?;
             sample.AddBuffer(&buf)?;
-            sample.SetSampleTime(index as i64 * self.frame_dur)?;
-            sample.SetSampleDuration(self.frame_dur)?;
+            let t = frame_time(index, self.fps);
+            sample.SetSampleTime(t)?;
+            sample.SetSampleDuration(frame_time(index + 1, self.fps) - t)?;
             self.writer.WriteSample(self.video, &sample)
         }
     }
 
     /// pos（先頭からのサンプルフレーム数）の位置に 16bit ステレオ PCM を書き込む
     pub fn write_audio(&self, pcm: &[i16], pos: u64) -> Result<()> {
-        let Some(idx) = self.audio else { return Ok(()) };
-        if pcm.is_empty() {
-            return Ok(());
-        }
-        unsafe {
-            let bytes = (pcm.len() * 2) as u32;
-            let buf = MFCreateMemoryBuffer(bytes)?;
-            let mut ptr = std::ptr::null_mut();
-            buf.Lock(&mut ptr, None, None)?;
-            std::ptr::copy_nonoverlapping(pcm.as_ptr() as *const u8, ptr, bytes as usize);
-            buf.Unlock()?;
-            buf.SetCurrentLength(bytes)?;
-            let sample = MFCreateSample()?;
-            sample.AddBuffer(&buf)?;
-            let frames = (pcm.len() / AUDIO_CH as usize) as i64;
-            sample.SetSampleTime(pos as i64 * 10_000_000 / AUDIO_RATE as i64)?;
-            sample.SetSampleDuration(frames * 10_000_000 / AUDIO_RATE as i64)?;
-            self.writer.WriteSample(idx, &sample)
+        match self.audio {
+            Some(idx) => write_pcm(&self.writer, idx, pcm, pos),
+            None => Ok(()),
         }
     }
 
     pub fn finish(&self) -> Result<()> {
         unsafe { self.writer.Finalize() }
     }
+}
+
+/// MP4 を書く SinkWriter（d3d を渡すとハードウェアエンコーダに GPU のテクスチャを直接渡せる）
+pub fn mp4_writer(path: &str, d3d: Option<&IMFDXGIDeviceManager>) -> Result<IMFSinkWriter> {
+    unsafe {
+        let mut attrs = None;
+        MFCreateAttributes(&mut attrs, 4)?;
+        let attrs = attrs.unwrap();
+        if let Some(m) = d3d {
+            attrs.SetUnknown(&MF_SINK_WRITER_D3D_MANAGER, m)?;
+            attrs.SetUINT32(&MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS, 1)?;
+        }
+        // 書き込みを待たせない（ゲームに合わせて遅れたぶんを取り戻せるように）
+        let _ = attrs.SetUINT32(&MF_SINK_WRITER_DISABLE_THROTTLING, 1);
+        attrs.SetGUID(&MF_TRANSCODE_CONTAINERTYPE, &MFTranscodeContainerType_MPEG4)?;
+        MFCreateSinkWriterFromURL(&HSTRING::from(path), None, &attrs)
+    }
+}
+
+/// 16bit ステレオ PCM を受け取り、AAC 192kbps で書くストリームを足す
+pub fn add_audio(writer: &IMFSinkWriter) -> Result<u32> {
+    unsafe {
+        let out = MFCreateMediaType()?;
+        out.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Audio)?;
+        out.SetGUID(&MF_MT_SUBTYPE, &MFAudioFormat_AAC)?;
+        out.SetUINT32(&MF_MT_AUDIO_BITS_PER_SAMPLE, 16)?;
+        out.SetUINT32(&MF_MT_AUDIO_SAMPLES_PER_SECOND, AUDIO_RATE)?;
+        out.SetUINT32(&MF_MT_AUDIO_NUM_CHANNELS, AUDIO_CH)?;
+        // AAC エンコーダが受け付けるのは 12000/16000/20000/24000 (byte/s) のみ。24000 = 192kbps
+        out.SetUINT32(&MF_MT_AUDIO_AVG_BYTES_PER_SECOND, 24_000)?;
+        let idx = writer.AddStream(&out)?;
+
+        let inp = MFCreateMediaType()?;
+        inp.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Audio)?;
+        inp.SetGUID(&MF_MT_SUBTYPE, &MFAudioFormat_PCM)?;
+        inp.SetUINT32(&MF_MT_AUDIO_BITS_PER_SAMPLE, 16)?;
+        inp.SetUINT32(&MF_MT_AUDIO_SAMPLES_PER_SECOND, AUDIO_RATE)?;
+        inp.SetUINT32(&MF_MT_AUDIO_NUM_CHANNELS, AUDIO_CH)?;
+        inp.SetUINT32(&MF_MT_AUDIO_BLOCK_ALIGNMENT, AUDIO_CH * 2)?;
+        inp.SetUINT32(&MF_MT_AUDIO_AVG_BYTES_PER_SECOND, AUDIO_RATE * AUDIO_CH * 2)?;
+        writer.SetInputMediaType(idx, &inp, None)?;
+        Ok(idx)
+    }
+}
+
+/// pos（先頭からのサンプルフレーム数）の位置に PCM を書く
+pub fn write_pcm(writer: &IMFSinkWriter, idx: u32, pcm: &[i16], pos: u64) -> Result<()> {
+    if pcm.is_empty() {
+        return Ok(());
+    }
+    unsafe {
+        let bytes = (pcm.len() * 2) as u32;
+        let buf = MFCreateMemoryBuffer(bytes)?;
+        let mut ptr = std::ptr::null_mut();
+        buf.Lock(&mut ptr, None, None)?;
+        std::ptr::copy_nonoverlapping(pcm.as_ptr() as *const u8, ptr, bytes as usize);
+        buf.Unlock()?;
+        buf.SetCurrentLength(bytes)?;
+        let sample = MFCreateSample()?;
+        sample.AddBuffer(&buf)?;
+        let frames = (pcm.len() / AUDIO_CH as usize) as i64;
+        let t = audio_time(pos);
+        sample.SetSampleTime(t)?;
+        sample.SetSampleDuration(audio_time(pos + frames as u64) - t)?;
+        writer.WriteSample(idx, &sample)
+    }
+}
+
+/// 音声のサンプル位置の時刻（100ns 単位）
+pub fn audio_time(pos: u64) -> i64 {
+    (pos as i128 * 10_000_000 / AUDIO_RATE as i128) as i64
+}
+
+/// 時刻（100ns 単位）に対応する音声のサンプル位置
+pub fn audio_pos(t: i64) -> u64 {
+    (t.max(0) as i128 * AUDIO_RATE as i128 / 10_000_000) as u64
 }
 
 /// SinkWriter が選んだエンコーダ MFT の名前（ソフトウェアなら印を付ける）

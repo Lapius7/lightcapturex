@@ -129,8 +129,9 @@ impl Capture {
         let session = pool.CreateCaptureSession(&item)?;
         let _ = session.SetIsBorderRequired(false);
         let _ = session.SetIsCursorCaptureEnabled(cursor);
-        // 高 fps のゲームでも、録画の fps を超える頻度では画面を取り込ませない（Windows 11 24H2 以降）
-        let _ = session.SetMinUpdateInterval(TimeSpan { Duration: 10_000_000 / fps.max(1) as i64 });
+        // 高 fps のゲームで取り込みすぎないよう間隔に下限を付ける（Windows 11 24H2 以降）。
+        // ちょうど 1/fps にすると、ゲームの表示間隔とのずれで取り込みが 1 回おきに抜け、実効 fps が落ちるので半分にする
+        let _ = session.SetMinUpdateInterval(TimeSpan { Duration: 10_000_000 / (fps.max(1) as i64 * 2) });
         session.StartCapture()?;
         Ok(Self { _item: item, pool, session, d3d, pool_size: size })
     }

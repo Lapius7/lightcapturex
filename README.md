@@ -29,6 +29,7 @@ Capture, color conversion, scaling and encoding all run on the GPU, so it barely
 - Audio mixed into one track:
   - PC sound: off / everything / **selected apps only** (e.g. only VALORANT + Discord)
   - Microphone
+- **Replay buffer**: keeps the last few seconds (5–300) in the background, even when not recording, and saves them when you press a hotkey (default **F10**). Replays can go to their own folder, and it works while recording too
 - Global hotkey to start/stop (default **F9**, changeable in the settings tab)
 - Live stats while recording: elapsed time, file size, real fps, dropped frames, audio level meters, CPU/GPU usage
 - Recordings tab: list, play, show in folder, delete
@@ -63,6 +64,12 @@ Recordings are saved to `Videos\LightCaptureX\LightCaptureX_YYYYMMDD_HHMMSS.mp4`
 ### Recording only some apps' sound
 
 Set "PC の音" (PC sound) to "アプリ" (apps), then click the "アプリ" row to open the app list. It shows running apps with their icons and marks the ones playing sound right now; VALORANT and Discord are listed even when they aren't running. Check the apps to record. Apps launched after recording starts are picked up automatically.
+
+### Replay buffer
+
+Turn on "リプレイバッファ" (replay buffer) in the settings tab and pick the length with "長さ". While it's on, the app keeps capturing the screen and sound, even when you aren't recording, and keeps the most recent part in a temp folder. Press the replay hotkey (default **F10**) or the "保存" (save) button in the record tab to save it to `Videos\LightCaptureX\Replays\LightCaptureX_Replay_YYYYMMDD_HHMMSS.mp4`. You can change the folder in the settings tab. The buffered video is deleted when the app exits.
+
+Replays use the record tab's settings (source, quality, audio, and so on). Capturing and encoding keep running while the buffer is on, so it uses some GPU even when you aren't recording.
 
 ### Tips
 

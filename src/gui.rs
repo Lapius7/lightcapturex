@@ -4,7 +4,7 @@ use crate::apps::{self, AppEntry};
 use crate::capture::{list_sources, Source, SourceInfo};
 use crate::encoder::{self, Codec};
 use crate::gfx::{glyph, tok, Align, Font, Painter, C, R};
-use crate::recorder::{self, Recorder, Settings};
+use crate::recorder::{self, Pipeline, Settings};
 use crate::recs::{self, RecEntry};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -25,10 +25,23 @@ use windows::Win32::UI::Input::KeyboardAndMouse::*;
 use windows::Win32::UI::Shell::{FOLDERID_Videos, SHGetKnownFolderPath, ShellExecuteW, KF_FLAG_DEFAULT};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
-const HOTKEY: i32 = 1;
+/// ショートカットの登録 ID（0: 録画の開始・停止, 1: リプレイの保存）
+const HOTKEYS: [i32; 2] = [1, 2];
+/// ショートカットの既定（F9, F10）
+const KEY_DEFAULT: [(u32, u32); 2] = [(0, 0x78), (0, 0x79)];
+const K_REC: usize = 0;
+const K_REPLAY: usize = 1;
 const WM_MOUSELEAVE: u32 = 0x02A3;
 const TIMER: usize = 1;
 const METER: usize = 2;
+/// 設定を変えたあと、少し待ってからリプレイを作り直す
+const SYNC: usize = 3;
+/// リプレイの保存が終わったときのメッセージ
+const WM_REPLAY: u32 = WM_APP + 6;
+/// リプレイの長さ（秒）
+const RP_MIN: u32 = crate::replay::MIN_SECS;
+const RP_MAX: u32 = crate::replay::MAX_SECS;
+const RP_STEP: u32 = 5;
 /// 別のインスタンスから「画面を出して」と頼むメッセージ
 const WM_SHOWME: u32 = WM_APP + 2;
 static ANNOUNCED: AtomicBool = AtomicBool::new(false);
@@ -70,16 +83,23 @@ enum Ctl {
     ListOpen,
     ListShow,
     ListDel,
+    ReplaySave,
     SetDir,
     SetDirOpen,
+    SetRDir,
+    SetRDirOpen,
+    ReplayTog,
+    ReplaySecs,
     SetKey,
     SetKeyReset,
+    SetRKey,
+    SetRKeyReset,
     TogTray,
     TogNotify,
     TogUpd,
     UpdBtn,
 }
-const ORDER: [Ctl; 23] = [
+const ORDER: [Ctl; 30] = [
     Ctl::Tab,
     Ctl::Source,
     Ctl::Quality,
@@ -92,13 +112,20 @@ const ORDER: [Ctl; 23] = [
     Ctl::Sys,
     Ctl::Apps,
     Ctl::Mic,
+    Ctl::ReplaySave,
     Ctl::Rec,
     Ctl::Folder,
     Ctl::ListRefresh,
     Ctl::SetDir,
     Ctl::SetDirOpen,
+    Ctl::SetRDir,
+    Ctl::SetRDirOpen,
+    Ctl::ReplayTog,
+    Ctl::ReplaySecs,
     Ctl::SetKey,
     Ctl::SetKeyReset,
+    Ctl::SetRKey,
+    Ctl::SetRKeyReset,
     Ctl::TogTray,
     Ctl::TogNotify,
     Ctl::TogUpd,
@@ -160,16 +187,41 @@ struct Ui {
     names: Vec<(String, String)>,
     /// ユーザーが最後に選んだ録画対象。ゲームを後から起動しても F9 で自動的に選び直す
     preferred: Option<String>,
-    rec: Option<(Recorder, Instant, PathBuf)>,
+    /// 取り込みの処理。リプレイがオンなら録画していないときも動いている
+    pipe: Option<Pipeline>,
+    /// 録画中のファイル（開始時刻, パス）
+    rec: Option<(Instant, PathBuf)>,
     last_file: Option<PathBuf>,
     out_dir: String,
-    hotkey_ok: bool,
+    /// リプレイの保存先
+    replay_dir: String,
+    replay_on: bool,
+    /// リプレイの長さ（秒）
+    replay_secs: u32,
+    /// 溜まっている秒数
+    replay_buf: f64,
+    replay_saving: bool,
+    /// リプレイが止まった理由（設定を変えるまで作り直さない）
+    replay_fail: Option<String>,
+    /// リプレイを用意している（作り直しの最中）
+    replay_prep: bool,
+    /// リプレイが動いていて、保存できる
+    replay_live: bool,
+    /// tick の回数（録画対象の見直しを間引く）
+    tick_n: u32,
+    /// 直前のリプレイ保存の結果と時刻（数秒だけ出す）
+    replay_msg: Option<(String, Instant)>,
+    /// 通知を押したときに開くフォルダー
+    notify_dir: Option<PathBuf>,
+    /// 録画を始めたときのドロップ数（取り込みを使い回すので差を出す）
+    drop0: u64,
+    hotkey_ok: [bool; 2],
     tab: Tab,
     free: Option<u64>,
-    /// ショートカット（修飾キー MOD_*, 仮想キー）
-    hotkey: (u32, u32),
-    /// ショートカットの入力待ち
-    capturing: bool,
+    /// ショートカット（修飾キー MOD_*, 仮想キー）。0: 録画, 1: リプレイの保存
+    hotkey: [(u32, u32); 2],
+    /// ショートカットの入力待ち（どちらのキーか）
+    capturing: Option<usize>,
     /// 画面に出す短い通知（ショートカットが使えないときなど）
     note: Option<String>,
     tray_close: bool,
@@ -240,9 +292,15 @@ const VIDEO: R = R::new(PAD, 112.0, 412.0, 364.0);
 const AUDIO: R = R::new(448.0, 112.0, 292.0, 184.0);
 const PANEL: R = R::new(448.0, 312.0, 292.0, 164.0);
 const FOOTER: R = R::new(PAD, 492.0, W - PAD * 2.0, 32.0);
-const SET_DIR: R = R::new(PAD, 62.0, W - PAD * 2.0, 116.0);
-const SET_KEY: R = R::new(PAD, 194.0, W - PAD * 2.0, 96.0);
-const SET_ACT: R = R::new(PAD, 306.0, W - PAD * 2.0, 44.0 + ROW * 3.0 + 4.0);
+// 設定タブは 2 列（左: 保存先・リプレイ, 右: ショートカット・動作）
+const COL_W: f32 = (W - PAD * 2.0 - 16.0) / 2.0;
+const COL_R: f32 = PAD + COL_W + 16.0;
+const SET_DIR: R = R::new(PAD, 62.0, COL_W, 196.0);
+const SET_RP: R = R::new(PAD, 274.0, COL_W, 44.0 + ROW * 2.0 + 64.0);
+const SET_KEY: R = R::new(COL_R, 62.0, COL_W, 44.0 + ROW * 2.0 + 36.0);
+const SET_ACT: R = R::new(COL_R, 242.0, COL_W, 44.0 + ROW * 4.0 + 4.0);
+/// 録画パネルの中の、リプレイの行
+const RP_ROW: R = R::new(PANEL.x + 16.0, PANEL.y + 68.0, PANEL.w - 32.0, 32.0);
 const LIST: R = R::new(PAD, 96.0, W - PAD * 2.0, 392.0);
 const LROW: f32 = 56.0;
 const LVIS: usize = 7;
@@ -276,24 +334,51 @@ fn ctl_rect(c: Ctl) -> R {
         Ctl::Folder => R::new(FOOTER.right() - 132.0, FOOTER.y, 132.0, 32.0),
         Ctl::Tab => R::new((W - 216.0) / 2.0, 14.0, 216.0, 32.0),
         Ctl::ListRefresh => R::new(W - PAD - 96.0, 54.0, 96.0, 32.0),
-        Ctl::SetDir => R::new(SET_DIR.right() - 16.0 - 96.0 - 8.0 - 96.0, SET_DIR.y + 52.0, 96.0, 32.0),
-        Ctl::SetDirOpen => R::new(SET_DIR.right() - 16.0 - 96.0, SET_DIR.y + 52.0, 96.0, 32.0),
-        Ctl::SetKey => R::new(SET_KEY.right() - 16.0 - 96.0 - 8.0 - 112.0, SET_KEY.y + 44.0, 112.0, 32.0),
-        Ctl::SetKeyReset => R::new(SET_KEY.right() - 16.0 - 96.0, SET_KEY.y + 44.0, 96.0, 32.0),
+        Ctl::ReplaySave => R::new(RP_ROW.right() - 104.0, RP_ROW.y, 104.0, 32.0),
+        Ctl::SetDir => dir_field(0),
+        Ctl::SetDirOpen => dir_open(0),
+        Ctl::SetRDir => dir_field(1),
+        Ctl::SetRDirOpen => dir_open(1),
+        Ctl::ReplayTog => row(SET_RP, 0).inset(8.0, 2.0),
+        Ctl::ReplaySecs => field(SET_RP, 1, LABEL_A),
+        Ctl::SetKey => key_btn(0),
+        Ctl::SetKeyReset => key_reset(0),
+        Ctl::SetRKey => key_btn(1),
+        Ctl::SetRKeyReset => key_reset(1),
         Ctl::TogTray => row(SET_ACT, 0).inset(8.0, 2.0),
         Ctl::TogNotify => row(SET_ACT, 1).inset(8.0, 2.0),
         Ctl::TogUpd => row(SET_ACT, 2).inset(8.0, 2.0),
-        Ctl::UpdBtn => R::new(SET_ACT.right() - 16.0 - 120.0, SET_ACT.y + 6.0, 120.0, 32.0),
+        Ctl::UpdBtn => R::new(SET_ACT.right() - 16.0 - 112.0, row(SET_ACT, 3).y + 6.0, 112.0, 32.0),
         // 一覧の行の中身は list_row_rect で決める
         Ctl::ListOpen | Ctl::ListShow | Ctl::ListDel => R::default(),
     }
+}
+
+/// 保存先の欄（0: 録画, 1: リプレイ）。押すとフォルダーを選ぶ
+fn dir_field(i: usize) -> R {
+    R::new(SET_DIR.x + 16.0, SET_DIR.y + 64.0 + i as f32 * 62.0, SET_DIR.w - 32.0 - 8.0 - 40.0, 32.0)
+}
+
+fn dir_open(i: usize) -> R {
+    R::new(SET_DIR.right() - 16.0 - 40.0, SET_DIR.y + 64.0 + i as f32 * 62.0, 40.0, 32.0)
+}
+
+/// ショートカットのキーの札（押すと入力待ちになる）と、既定に戻すボタン
+fn key_btn(k: usize) -> R {
+    let r = row(SET_KEY, k);
+    R::new(r.right() - 16.0 - 80.0 - 8.0 - 120.0, r.y + 6.0, 120.0, 32.0)
+}
+
+fn key_reset(k: usize) -> R {
+    let r = row(SET_KEY, k);
+    R::new(r.right() - 16.0 - 80.0, r.y + 6.0, 80.0, 32.0)
 }
 
 /// 押せる範囲（高さ 40 以上。カーソルの行は見出しごと押せる）
 fn hit_rect(c: Ctl) -> R {
     match c {
         Ctl::Cursor => row(VIDEO, 6).inset(8.0, 2.0),
-        Ctl::Source | Ctl::Rec | Ctl::TogTray | Ctl::TogNotify | Ctl::TogUpd => ctl_rect(c),
+        Ctl::Source | Ctl::Rec | Ctl::TogTray | Ctl::TogNotify | Ctl::TogUpd | Ctl::ReplayTog => ctl_rect(c),
         _ => ctl_rect(c).inset(0.0, -4.0),
     }
 }
@@ -335,8 +420,21 @@ fn enabled(u: &Ui, c: Ctl) -> bool {
         Ctl::Tab => true,
         Ctl::ListRefresh | Ctl::ListOpen | Ctl::ListShow | Ctl::ListDel => u.tab == Tab::List,
         Ctl::SetDir => u.tab == Tab::Set && !busy && u.status != Status::Recording,
-        Ctl::SetDirOpen | Ctl::SetKey | Ctl::SetKeyReset | Ctl::TogTray | Ctl::TogNotify | Ctl::TogUpd | Ctl::UpdBtn => u.tab == Tab::Set && !busy,
+        Ctl::ReplaySecs => u.tab == Tab::Set && !busy && u.replay_on,
+        Ctl::SetDirOpen
+        | Ctl::SetRDir
+        | Ctl::SetRDirOpen
+        | Ctl::ReplayTog
+        | Ctl::SetKey
+        | Ctl::SetKeyReset
+        | Ctl::SetRKey
+        | Ctl::SetRKeyReset
+        | Ctl::TogTray
+        | Ctl::TogNotify
+        | Ctl::TogUpd
+        | Ctl::UpdBtn => u.tab == Tab::Set && !busy,
         _ if u.tab != Tab::Rec => false,
+        Ctl::ReplaySave => u.replay_on && u.replay_live && !u.replay_saving && !busy,
         _ => match u.status {
             Status::Starting | Status::Saving => c == Ctl::Folder,
             Status::Recording => matches!(c, Ctl::Rec | Ctl::Folder),
@@ -591,13 +689,14 @@ fn bitrate_text(k: u32) -> String {
 }
 
 fn is_slider(c: Ctl) -> bool {
-    matches!(c, Ctl::Fps | Ctl::Bitrate)
+    matches!(c, Ctl::Fps | Ctl::Bitrate | Ctl::ReplaySecs)
 }
 
 /// 値の範囲（両端を含む）
 fn slider_range(c: Ctl) -> (u32, u32) {
     match c {
         Ctl::Fps => (FPS_MIN, FPS_MAX),
+        Ctl::ReplaySecs => (RP_MIN, RP_MAX),
         _ => (0, BR_MAX),
     }
 }
@@ -605,7 +704,17 @@ fn slider_range(c: Ctl) -> (u32, u32) {
 fn slider_value(u: &Ui, c: Ctl) -> u32 {
     match c {
         Ctl::Fps => u.fps,
+        Ctl::ReplaySecs => u.replay_secs,
         _ => u.bitrate,
+    }
+}
+
+/// 数値の単位（直接入力のときに出す）
+fn slider_unit(c: Ctl) -> &'static str {
+    match c {
+        Ctl::Fps => " fps",
+        Ctl::ReplaySecs => " 秒",
+        _ => " kbps",
     }
 }
 
@@ -618,6 +727,7 @@ fn slider_track(c: Ctl) -> R {
 fn slider_text(c: Ctl, v: u32) -> String {
     match c {
         Ctl::Fps => format!("{v} fps"),
+        Ctl::ReplaySecs => format!("{v} 秒"),
         _ => bitrate_text(v),
     }
 }
@@ -631,6 +741,9 @@ fn slider_from_x(c: Ctl, x: f32) -> u32 {
     let v = lo + (f * (hi - lo) as f32).round() as u32;
     if c == Ctl::Bitrate {
         return (v + BR_STEP / 2) / BR_STEP * BR_STEP;
+    }
+    if c == Ctl::ReplaySecs {
+        return ((v + RP_STEP / 2) / RP_STEP * RP_STEP).clamp(lo, hi);
     }
     if c == Ctl::Fps {
         if let Some(&p) = FPS_PRESETS.iter().find(|&&p| p.abs_diff(v) <= 3) {
@@ -646,7 +759,7 @@ fn commit_edit() {
     if let Some((c, t)) = e {
         if let Ok(v) = t.parse::<u32>() {
             set_slider(c, v);
-            save_config();
+            changed();
         }
         invalidate_main();
     }
@@ -658,6 +771,7 @@ fn set_slider(c: Ctl, v: u32) {
         let mut u = u.borrow_mut();
         match c {
             Ctl::Fps => u.fps = v.clamp(lo, hi),
+            Ctl::ReplaySecs => u.replay_secs = v.clamp(lo, hi),
             _ => u.bitrate = v.clamp(lo, hi),
         }
     });
@@ -696,7 +810,7 @@ fn draw_slider(u: &Ui, p: &Painter, c: Ctl) {
     let vr = R::new(t.right() + 8.0, r.y, r.right() - t.right() - 8.0, r.h);
     let editing = u.edit.as_ref().filter(|(ec, _)| *ec == c);
     if let Some((_, buf)) = editing {
-        let unit = if c == Ctl::Fps { " fps" } else { " kbps" };
+        let unit = slider_unit(c);
         let caret = if u.blink { "|" } else { " " };
         p.fill(R::new(vr.x + 6.0, vr.y + 5.0, vr.w - 6.0, vr.h - 10.0), 6.0, tok::BG);
         p.text(&format!("{buf}{caret}{unit}"), R::new(vr.x, vr.y, vr.w - 8.0, vr.h), Font::strong(13.0).at(Align::Right), tok::TEXT);
@@ -796,9 +910,9 @@ fn draw_rec(u: &Ui, p: &Painter) {
         p.dot(x0 + 5.0, cy, 5.0, tok::ON_ACCENT);
     }
     p.text(text, R::new(x0 + 18.0, r.y, tw + 4.0, r.h), f, fg);
-    let parts = key_parts(u.hotkey);
+    let parts = key_parts(u.hotkey[K_REC]);
     let cw = caps_width(p, &parts);
-    if u.hotkey_ok && cw <= 64.0 {
+    if u.hotkey_ok[K_REC] && cw <= 64.0 {
         keycaps(p, r.right() - 12.0 - cw, cy, &parts, cap, None, fg);
     }
     if s.press {
@@ -844,7 +958,75 @@ fn draw_panel(u: &Ui, p: &Painter) {
     let time = format!("{:02}:{:02}:{:02}", s / 3600, s / 60 % 60, s % 60);
     let active = u.status == Status::Recording;
     p.text(&time, R::new(PANEL.x + 16.0, PANEL.y + 32.0, PANEL.w - 32.0, 30.0), Font::strong(24.0), if active { tok::TEXT } else { tok::TEXT_3 });
+    draw_replay_row(u, p);
     draw_rec(u, p);
+}
+
+/// リプレイの状態（パネル・設定タブ・トレーで使う短い文）と、注意の色にするか
+/// short: 録画タブの狭い行に出すとき。エラーの中身は設定タブに出す
+fn replay_state(u: &Ui, short: bool) -> (String, bool) {
+    let fresh_msg = u.replay_msg.as_ref().filter(|(_, t)| t.elapsed().as_secs() < 5);
+    if !u.replay_on {
+        ("オフ".into(), false)
+    } else if u.replay_saving {
+        ("保存しています…".into(), false)
+    } else if let Some((m, _)) = fresh_msg {
+        (m.clone(), false)
+    } else if let Some(e) = &u.replay_fail {
+        (if short { "止まりました".into() } else { format!("止まりました: {e}") }, true)
+    } else if u.replay_prep || !u.replay_live {
+        ("準備しています…".into(), false)
+    } else {
+        let have = u.replay_buf.min(u.replay_secs as f64).floor() as u32;
+        (format!("{have} / {} 秒", u.replay_secs), false)
+    }
+}
+
+fn draw_replay_row(u: &Ui, p: &Painter) {
+    if !u.replay_on {
+        return;
+    }
+    let r = RP_ROW;
+    p.line(r.x, r.y - 6.0, r.right(), r.y - 6.0, tok::HAIR, 1.0);
+    let (text, warn) = replay_state(u, true);
+    let cy = r.y + r.h / 2.0;
+    let ready = u.replay_live && u.replay_fail.is_none();
+    if warn {
+        p.glyph(glyph::ERROR, R::new(r.x - 2.0, r.y, 12.0, r.h), 11.0, tok::REC);
+    } else {
+        p.dot(r.x + 4.0, cy, 4.0, if ready { tok::TEXT_2 } else { tok::TEXT_3 });
+    }
+    let lf = Font::text(12.0);
+    let lw = p.measure("リプレイ", lf);
+    p.text("リプレイ", R::new(r.x + 16.0, r.y, lw + 2.0, r.h), lf, tok::TEXT_3);
+    let tx = r.x + 16.0 + lw + 10.0;
+    let btn = ctl_rect(Ctl::ReplaySave);
+    p.text(&fit_end(p, &text, lf, btn.x - 8.0 - tx), R::new(tx, r.y, btn.x - 8.0 - tx, r.h), lf, if warn { tok::TEXT } else { tok::TEXT_2 });
+    // 保存ボタン（キーの札つき）
+    let s = st(u, Ctl::ReplaySave, 0);
+    if s.press {
+        p.scale(btn, 0.96);
+    }
+    let fill = if !s.on { tok::CTRL } else if s.press { tok::CTRL_PRESS } else if s.hover { tok::CTRL_HOVER } else { tok::CTRL };
+    p.fill(btn, tok::R_CTRL, fill);
+    let fg = if !s.on { tok::TEXT_3 } else if s.hover { tok::TEXT } else { tok::TEXT_2 };
+    let f = Font::text(12.5);
+    let parts = key_parts(u.hotkey[K_REPLAY]);
+    let cw = caps_width(p, &parts);
+    let show_key = u.hotkey_ok[K_REPLAY] && cw <= 52.0;
+    let tw = p.measure("保存", f);
+    let total = tw + if show_key { 8.0 + cw } else { 0.0 };
+    let x0 = (btn.x + (btn.w - total) / 2.0).round();
+    p.text("保存", R::new(x0, btn.y, tw + 2.0, btn.h), f, fg);
+    if show_key {
+        keycaps(p, x0 + tw + 8.0, cy, &parts, tok::SEG_ON, None, fg);
+    }
+    if s.press {
+        p.unscale();
+    }
+    if s.focus {
+        ring(p, btn, tok::R_CTRL);
+    }
 }
 
 fn draw_folder(u: &Ui, p: &Painter) {
@@ -871,25 +1053,38 @@ fn draw_main(u: &Ui, p: &Painter) {
     // 見出し
     p.text("LightCaptureX", R::new(PAD, 18.0, 150.0, 28.0), Font::strong(15.0), tok::TEXT);
     draw_seg(u, p, Ctl::Tab);
-    let hr = R::new(W - PAD - 330.0, 18.0, 330.0, 28.0);
-    let small = Font::text(12.0);
-    if u.hotkey_ok {
-        let t = "で録画を開始・停止";
-        let tw = p.measure(t, small);
-        p.text(t, R::new(hr.right() - tw - 2.0, hr.y, tw + 2.0, hr.h), small, tok::TEXT_3);
-        let parts = key_parts(u.hotkey);
-        let cw = caps_width(p, &parts);
-        keycaps(p, hr.right() - tw - 10.0 - cw, hr.y + 14.0, &parts, tok::CTRL, Some(tok::EDGE), tok::TEXT_2);
-    } else {
-        let t = format!("{} はほかのアプリが使用中", key_text(u.hotkey));
-        let tw = p.measure(&t, small);
-        p.text(&t, R::new(hr.right() - tw - 2.0, hr.y, tw + 2.0, hr.h), small, tok::TEXT_2);
-        p.glyph(glyph::WARNING, R::new(hr.right() - tw - 24.0, hr.y, 16.0, hr.h), 12.0, tok::TEXT_2);
-    }
+    draw_head_keys(u, p);
     match u.tab {
         Tab::Rec => draw_rec_tab(u, p),
         Tab::List => draw_list(u, p),
         Tab::Set => draw_set(u, p),
+    }
+}
+
+/// 右上のショートカットの案内。右から順に並べる
+fn draw_head_keys(u: &Ui, p: &Painter) {
+    let hr = R::new(W - PAD - 250.0, 18.0, 250.0, 28.0);
+    let small = Font::text(12.0);
+    let mut items = vec![(K_REC, if u.replay_on { "録画" } else { "で録画を開始・停止" })];
+    if u.replay_on {
+        items.push((K_REPLAY, "リプレイ保存"));
+    }
+    // 使えないキーがあれば、その注意だけを出す
+    if let Some(&(k, _)) = items.iter().find(|(k, _)| !u.hotkey_ok[*k]) {
+        let t = format!("{} はほかのアプリが使用中", key_text(u.hotkey[k]));
+        let tw = p.measure(&t, small);
+        p.text(&t, R::new(hr.right() - tw - 2.0, hr.y, tw + 2.0, hr.h), small, tok::TEXT_2);
+        p.glyph(glyph::WARNING, R::new(hr.right() - tw - 24.0, hr.y, 16.0, hr.h), 12.0, tok::TEXT_2);
+        return;
+    }
+    let mut x = hr.right();
+    for (k, t) in items.into_iter().rev() {
+        let tw = p.measure(t, small);
+        p.text(t, R::new(x - tw - 2.0, hr.y, tw + 2.0, hr.h), small, tok::TEXT_3);
+        let parts = key_parts(u.hotkey[k]);
+        let cw = caps_width(p, &parts);
+        keycaps(p, x - tw - 8.0 - cw, hr.y + 14.0, &parts, tok::CTRL, Some(tok::EDGE), tok::TEXT_2);
+        x -= tw + 8.0 + cw + 16.0;
     }
 }
 
@@ -963,6 +1158,21 @@ fn fit(p: &Painter, s: &str, f: Font, w: f32) -> String {
     String::new()
 }
 
+/// 文の頭を残して末尾を … で切る（状態やエラーの文向け。fit はパス向けで頭を切る）
+fn fit_end(p: &Painter, s: &str, f: Font, w: f32) -> String {
+    if p.measure(s, f) <= w {
+        return s.to_string();
+    }
+    let chars: Vec<char> = s.chars().collect();
+    for n in (1..chars.len()).rev() {
+        let t: String = chars[..n].iter().copied().chain(std::iter::once('…')).collect();
+        if p.measure(&t, f) <= w {
+            return t;
+        }
+    }
+    String::new()
+}
+
 fn tile(p: &Painter, r: R, label: &str, value: &str, unit: &str, hot: bool) {
     p.fill(r, tok::R_CTRL, tok::CTRL);
     p.text(label, R::new(r.x + 12.0, r.y + 8.0, r.w - 24.0, 16.0), Font::text(11.5), tok::TEXT_3);
@@ -988,7 +1198,8 @@ fn draw_live(u: &Ui, p: &Painter) {
     let tw = (VIDEO.w - 32.0 - 16.0) / 3.0;
     let tr = |col: usize, rw: usize| R::new(VIDEO.x + 16.0 + col as f32 * (tw + 8.0), VIDEO.y + 44.0 + rw as f32 * 72.0, tw, 64.0);
     tile(p, tr(0, 0), "ファイルサイズ", &format!("{:.1}", u.size_mb), "MB", false);
-    tile(p, tr(1, 0), "実 fps", &format!("{:.0}", u.fps_now), &format!("/ {target:.0}"), u.fps_now > 0.0 && u.fps_now < target * 0.9);
+    // 画面が変わらないと取り込みの回数も減る（録画は一定の fps のまま）ので、赤くはしない
+    tile(p, tr(1, 0), "画面の更新", &format!("{:.0}", u.fps_now), &format!("/ {target:.0} fps"), false);
     tile(p, tr(2, 0), "ドロップ", &u.dropped.to_string(), "枚", u.dropped > 0);
     let (c, cu) = pct(u.cpu);
     let (g, gu) = pct(u.gpu_load);
@@ -998,7 +1209,7 @@ fn draw_live(u: &Ui, p: &Painter) {
 
     // fps の推移
     let top = VIDEO.y + 44.0 + 144.0 + 4.0;
-    p.text("fps の推移（直近 60 秒）", R::new(VIDEO.x + 16.0, top, 240.0, 18.0), Font::text(11.5), tok::TEXT_3);
+    p.text("画面の更新（fps・直近 60 秒）", R::new(VIDEO.x + 16.0, top, 300.0, 18.0), Font::text(11.5), tok::TEXT_3);
     let g = R::new(VIDEO.x + 16.0, top + 22.0, VIDEO.w - 32.0, VIDEO.bottom() - 16.0 - (top + 22.0));
     p.fill(g, tok::R_CTRL, tok::CTRL);
     let top_v = (target * 1.1).max(u.fps_hist.iter().copied().fold(0.0, f32::max));
@@ -1012,7 +1223,7 @@ fn draw_live(u: &Ui, p: &Painter) {
         let x0 = gx + gw - step * (n - 1) as f32;
         for i in 1..n {
             let (a, b) = (u.fps_hist[i - 1], u.fps_hist[i]);
-            let col = if b < target * 0.9 { tok::REC } else { tok::TEXT_2 };
+            let col = tok::TEXT_2;
             p.line(x0 + step * (i - 1) as f32, yv(a), x0 + step * i as f32, yv(b), col, 1.5);
         }
         p.dot(gx + gw, yv(u.fps_hist[n - 1]), 3.0, tok::TEXT);
@@ -1082,13 +1293,18 @@ fn draw_btn(u: &Ui, p: &Painter, c: Ctl, icon: Option<u16>, text: &str) {
     p.fill(r, tok::R_CTRL, fill);
     let fg = if !s.on { tok::TEXT_3 } else if s.hover { tok::TEXT } else { tok::TEXT_2 };
     let f = Font::text(12.5);
-    let tw = p.measure(text, f);
-    let iw = if icon.is_some() { 22.0 } else { 0.0 };
-    let x0 = (r.x + (r.w - iw - tw) / 2.0).round();
-    if let Some(g) = icon {
-        p.glyph(g, R::new(x0, r.y, 16.0, r.h), 13.0, fg);
+    match (icon, text.is_empty()) {
+        (Some(g), true) => p.glyph(g, r, 14.0, fg),
+        _ => {
+            let tw = p.measure(text, f);
+            let iw = if icon.is_some() { 22.0 } else { 0.0 };
+            let x0 = (r.x + (r.w - iw - tw) / 2.0).round();
+            if let Some(g) = icon {
+                p.glyph(g, R::new(x0, r.y, 16.0, r.h), 13.0, fg);
+            }
+            p.text(text, R::new(x0 + iw, r.y, tw + 4.0, r.h), f, fg);
+        }
     }
-    p.text(text, R::new(x0 + iw, r.y, tw + 4.0, r.h), f, fg);
     if s.press {
         p.unscale();
     }
@@ -1123,53 +1339,97 @@ fn draw_switch(u: &Ui, p: &Painter, c: Ctl, on_state: bool, title: &str, sub: &s
 }
 
 fn draw_set(u: &Ui, p: &Painter) {
-    // 保存先
-    card(p, SET_DIR, Some("保存先"));
-    let fr = R::new(SET_DIR.x + 16.0, SET_DIR.y + 52.0, ctl_rect(Ctl::SetDir).x - 8.0 - (SET_DIR.x + 16.0), 32.0);
-    p.fill(fr, tok::R_CTRL, tok::CTRL);
-    p.glyph(glyph::FOLDER, R::new(fr.x + 12.0, fr.y, 18.0, fr.h), 14.0, tok::TEXT_2);
     let f = Font::text(12.5);
-    let path = fit(p, &u.out_dir, f, fr.w - 52.0);
-    p.text(&path, R::new(fr.x + 38.0, fr.y, fr.w - 46.0, fr.h), f, tok::TEXT);
-    draw_btn(u, p, Ctl::SetDir, Some(glyph::EDIT), "変更…");
-    draw_btn(u, p, Ctl::SetDirOpen, Some(glyph::FOLDER), "開く");
-    let free = u.free.map_or_else(|| "空き容量を調べられません".to_string(), |b| format!("空き容量  {}", recs::fmt_size(b)));
-    p.text(&free, R::new(SET_DIR.x + 16.0, SET_DIR.y + 88.0, SET_DIR.w - 32.0, 20.0), Font::text(12.0), tok::TEXT_3);
+    // 保存先（録画, リプレイ）
+    card(p, SET_DIR, Some("保存先"));
+    for (i, (name, path, c, co)) in [("録画", &u.out_dir, Ctl::SetDir, Ctl::SetDirOpen), ("リプレイ", &replay_dir_text(u), Ctl::SetRDir, Ctl::SetRDirOpen)].into_iter().enumerate() {
+        let fr = dir_field(i);
+        p.text(name, R::new(fr.x, fr.y - 22.0, 200.0, 18.0), Font::text(12.0), tok::TEXT_2);
+        let s = st(u, c, 0);
+        let fill = if !s.on { tok::CTRL } else if s.press { tok::CTRL_PRESS } else if s.hover { tok::CTRL_HOVER } else { tok::CTRL };
+        p.fill(fr, tok::R_CTRL, fill);
+        let fg = if s.on { tok::TEXT } else { tok::TEXT_3 };
+        p.text(&fit(p, path, f, fr.w - 48.0), R::new(fr.x + 12.0, fr.y, fr.w - 48.0, fr.h), f, fg);
+        p.glyph(glyph::EDIT, R::new(fr.right() - 32.0, fr.y, 24.0, fr.h), 12.0, if s.hover { tok::TEXT } else { tok::TEXT_3 });
+        if s.focus {
+            ring(p, fr, tok::R_CTRL);
+        }
+        draw_btn(u, p, co, Some(glyph::FOLDER), "");
+    }
+    let free = u.free.map_or_else(|| "空き容量を調べられません".to_string(), |b| format!("録画の保存先の空き容量  {}", recs::fmt_size(b)));
+    p.text(&free, R::new(SET_DIR.x + 16.0, SET_DIR.bottom() - 32.0, SET_DIR.w - 32.0, 20.0), Font::text(12.0), tok::TEXT_3);
+
+    // リプレイ
+    card(p, SET_RP, Some("リプレイ"));
+    draw_switch(u, p, Ctl::ReplayTog, u.replay_on, "リプレイバッファ", "直近の映像を溜めておき、キーで保存します");
+    label(p, SET_RP, 1, LABEL_A, "長さ", u.replay_on);
+    draw_slider(u, p, Ctl::ReplaySecs);
+    let (state, warn) = replay_state(u, false);
+    let line = R::new(SET_RP.x + 16.0, row(SET_RP, 2).y + 4.0, SET_RP.w - 32.0, 18.0);
+    let sf = Font::text(12.0);
+    let state = if u.replay_on { format!("状態  {state}") } else { "オンにすると、録画していないあいだも画面を取り込みます".to_string() };
+    p.text(&fit_end(p, &state, sf, line.w), line, sf, if warn { tok::TEXT } else { tok::TEXT_2 });
+    // 一時ファイルの目安（ビットレート × 秒数 + 区切り 1 つ分）
+    let hint = if u.bitrate > 0 && u.replay_on {
+        let mb = u.bitrate as f64 / 8.0 / 1000.0 * (u.replay_secs as u64 + crate::replay::SEG_SECS) as f64;
+        format!("一時フォルダーを最大 {} ほど使います", recs::fmt_size((mb * 1_048_576.0) as u64))
+    } else {
+        "溜めた映像は一時フォルダーに置き、終了時に消します".to_string()
+    };
+    p.text(&fit_end(p, &hint, Font::text(11.5), line.w), R::new(line.x, line.bottom() + 4.0, line.w, 16.0), Font::text(11.5), tok::TEXT_3);
 
     // ショートカット
     card(p, SET_KEY, Some("ショートカット"));
-    let cy = SET_KEY.y + 44.0 + 16.0;
-    p.text("録画の開始・停止", R::new(SET_KEY.x + 16.0, cy - 16.0, 150.0, 32.0), Font::text(13.0), tok::TEXT);
-    let kx = SET_KEY.x + 16.0 + 160.0;
-    if u.capturing {
-        p.dot(kx + 4.0, cy, 4.0, tok::REC);
-        p.text("キーを押してください（Esc で取り消し）", R::new(kx + 16.0, cy - 16.0, 300.0, 32.0), Font::text(13.0), tok::TEXT);
-    } else {
-        keycaps(p, kx, cy, &key_parts(u.hotkey), tok::CTRL, Some(tok::EDGE), tok::TEXT);
+    for (k, (title, c, cr)) in [("録画の開始・停止", Ctl::SetKey, Ctl::SetKeyReset), ("リプレイを保存", Ctl::SetRKey, Ctl::SetRKeyReset)].into_iter().enumerate() {
+        let r = row(SET_KEY, k);
+        let kr = key_btn(k);
+        p.text(title, R::new(r.x + 16.0, r.y, kr.x - 8.0 - (r.x + 16.0), r.h), Font::text(13.0), tok::TEXT);
+        let s = st(u, c, 0);
+        let waiting = u.capturing == Some(k);
+        let fill = if waiting || s.press { tok::CTRL_PRESS } else if s.hover { tok::CTRL_HOVER } else { tok::CTRL };
+        p.fill(kr, tok::R_CTRL, fill);
+        let cy = kr.y + kr.h / 2.0;
+        if waiting {
+            p.stroke(kr, tok::R_CTRL, tok::TEXT_3, 1.0);
+            p.text(if u.blink { "キーを押す…" } else { "キーを押す" }, kr, Font::text(12.5).at(Align::Center), tok::TEXT);
+        } else {
+            let parts = key_parts(u.hotkey[k]);
+            let cw = caps_width(p, &parts);
+            let fg = if u.hotkey_ok[k] { tok::TEXT } else { tok::TEXT_3 };
+            keycaps(p, (kr.x + (kr.w - cw) / 2.0).round(), cy, &parts, tok::SEG_ON, None, fg);
+        }
+        if s.focus {
+            ring(p, kr, tok::R_CTRL);
+        }
+        let dflt = KEY_DEFAULT[k];
+        draw_btn(u, p, cr, None, &format!("{} に戻す", key_text(dflt)));
     }
-    draw_btn(u, p, Ctl::SetKey, None, if u.capturing { "取り消し" } else { "変更…" });
-    draw_btn(u, p, Ctl::SetKeyReset, None, "F9 に戻す");
-    let (msg, col) = match (&u.note, u.hotkey_ok) {
-        (Some(n), _) => (n.clone(), tok::TEXT_2),
-        (None, false) => ("このキーはほかのアプリが使用中です".to_string(), tok::TEXT_2),
-        _ => ("Ctrl・Alt・Shift・Win と組み合わせることもできます".to_string(), tok::TEXT_3),
+    let bad = (0..2).find(|&k| !u.hotkey_ok[k]);
+    let (msg, col) = match (&u.note, u.capturing, bad) {
+        (_, Some(_), _) => ("修飾キーと組み合わせてもかまいません（Esc で取り消し）".to_string(), tok::TEXT_2),
+        (Some(n), _, _) => (n.clone(), tok::TEXT_2),
+        (None, _, Some(k)) => (format!("{} はほかのアプリが使用中です", key_text(u.hotkey[k])), tok::TEXT_2),
+        _ => ("キーの札を押して、新しいキーを押すと変わります".to_string(), tok::TEXT_3),
     };
-    p.text(&msg, R::new(SET_KEY.x + 16.0, SET_KEY.y + 76.0, SET_KEY.w - 32.0, 16.0), Font::text(11.5), col);
+    let ml = R::new(SET_KEY.x + 16.0, row(SET_KEY, 2).y + 2.0, SET_KEY.w - 32.0, 18.0);
+    p.text(&fit(p, &msg, Font::text(11.5), ml.w), ml, Font::text(11.5), col);
 
     // 動作
     card(p, SET_ACT, Some("動作"));
-    draw_switch(u, p, Ctl::TogTray, u.tray_close, "×で閉じたときトレーに残す", "オフにすると、×を押したときアプリを終了します");
-    draw_switch(u, p, Ctl::TogNotify, u.notify, "トレーの通知", "録画の開始・保存・失敗をトレーから知らせます");
-    draw_switch(u, p, Ctl::TogUpd, u.auto_update, "起動時に更新を確認", "新しい版があれば通知します。更新は確認してから行います");
+    draw_switch(u, p, Ctl::TogTray, u.tray_close, "×で閉じてもトレーに残す", "オフなら×でアプリを終了します");
+    draw_switch(u, p, Ctl::TogNotify, u.notify, "トレーの通知", "開始・保存・失敗を知らせます");
+    draw_switch(u, p, Ctl::TogUpd, u.auto_update, "起動時に更新を確認", "更新するかは毎回たずねます");
     let (msg, btn) = match update::state() {
         update::State::Checking => ("確認しています…".to_string(), "確認中…"),
         update::State::Latest => (format!("v{} · 最新です", update::VERSION), "更新を確認"),
-        update::State::Available(v) => (format!("v{} → v{v} に更新できます", update::VERSION), "更新する"),
+        update::State::Available(v) => (format!("v{v} に更新できます"), "更新する"),
         update::State::Downloading => ("ダウンロードしています…".to_string(), "更新中…"),
         update::State::Failed(m) => (m, "更新を確認"),
         update::State::Idle => (format!("v{}", update::VERSION), "更新を確認"),
     };
-    p.text(&msg, R::new(SET_ACT.x + 72.0, SET_ACT.y + 12.0, SET_ACT.w - 72.0 - 16.0 - 128.0 - 8.0, 20.0), Font::text(12.0), tok::TEXT_3);
+    let ub = ctl_rect(Ctl::UpdBtn);
+    let mr = R::new(SET_ACT.x + 16.0, ub.y, ub.x - 8.0 - (SET_ACT.x + 16.0), ub.h);
+    p.text(&fit(p, &msg, Font::text(12.0), mr.w), mr, Font::text(12.0), tok::TEXT_2);
     draw_btn(u, p, Ctl::UpdBtn, None, btn);
 }
 
@@ -1184,7 +1444,7 @@ fn draw_list(u: &Ui, p: &Painter) {
     if u.list.is_empty() {
         let c = R::new(LIST.x, LIST.y + LIST.h / 2.0 - 30.0, LIST.w, 28.0);
         p.text("録画はまだありません", c, Font::strong(14.0).at(Align::Center), tok::TEXT_2);
-        let hint = if u.hotkey_ok { format!("{} を押すと録画を始めます", key_text(u.hotkey)) } else { "録画タブの「録画開始」から始められます".to_string() };
+        let hint = if u.hotkey_ok[K_REC] { format!("{} を押すと録画を始めます", key_text(u.hotkey[K_REC])) } else { "録画タブの「録画開始」から始められます".to_string() };
         p.text(&hint, R::new(c.x, c.bottom() + 2.0, c.w, 22.0), Font::text(12.5).at(Align::Center), tok::TEXT_3);
     }
     let shown = u.list.len().saturating_sub(u.list_off).min(LVIS);
@@ -1222,7 +1482,18 @@ fn draw_list(u: &Ui, p: &Painter) {
             meta.push(recs::fmt_dur(s));
         }
         meta.push(recs::fmt_size(e.size));
-        p.text(&meta.join("  ·  "), R::new(rr.x + 104.0, rr.y + 30.0, nw, 16.0), Font::text(11.5), tok::TEXT_3);
+        let mut mx = rr.x + 104.0;
+        if e.replay {
+            // リプレイの保存先にあるものは札を付けて見分ける
+            let bf = Font::strong(10.5);
+            let bw = (p.measure("リプレイ", bf) + 12.0).ceil();
+            let br = R::new(mx, rr.y + 30.0, bw, 16.0);
+            p.fill(br, 4.0, tok::SEG_ON);
+            p.text("リプレイ", br, bf.at(Align::Center), tok::TEXT_2);
+            mx += bw + 8.0;
+        }
+        let mw = rr.x + 104.0 + nw - mx;
+        p.text(&fit(p, &meta.join("  ·  "), Font::text(11.5), mw), R::new(mx, rr.y + 30.0, mw, 16.0), Font::text(11.5), tok::TEXT_3);
         for (k, g) in [glyph::PLAY, glyph::FOLDER, glyph::DELETE].into_iter().enumerate() {
             let ctl = [Ctl::ListOpen, Ctl::ListShow, Ctl::ListDel][k];
             let br = list_btn_rect(i, k);
@@ -1758,7 +2029,7 @@ fn pick_toggle(i: usize) {
             u.sys = SYS_APPS;
         }
     });
-    save_config();
+    changed();
     invalidate_all();
 }
 
@@ -2065,7 +2336,7 @@ fn save_config() {
         let codec = u.codecs.get(u.codec).map(|c| c.label()).unwrap_or_default();
         let gpu = if u.gpu == 0 { String::new() } else { u.gpus.get(u.gpu - 1).cloned().unwrap_or_default() };
         format!(
-            "source={src}\nquality={}\nfps={}\nres={}\nmic={mic}\nsysmode={}\napps={}\ncursor={}\ncodec={codec}\ngpu={gpu}\ndir={}\nhotkey={},{}\ntray_close={}\nnotify={}\nauto_update={}\nbitrate_kbps={}\n",
+            "source={src}\nquality={}\nfps={}\nres={}\nmic={mic}\nsysmode={}\napps={}\ncursor={}\ncodec={codec}\ngpu={gpu}\ndir={}\nhotkey={},{}\ntray_close={}\nnotify={}\nauto_update={}\nbitrate_kbps={}\nreplay={}\nreplay_secs={}\nreplay_dir={}\nreplay_hotkey={},{}\n",
             u.quality,
             u.fps,
             u.res,
@@ -2073,12 +2344,17 @@ fn save_config() {
             u.apps.join("|"),
             u.cursor as u8,
             u.out_dir,
-            u.hotkey.0,
-            u.hotkey.1,
+            u.hotkey[K_REC].0,
+            u.hotkey[K_REC].1,
             u.tray_close as u8,
             u.notify as u8,
             u.auto_update as u8,
-            u.bitrate
+            u.bitrate,
+            u.replay_on as u8,
+            u.replay_secs,
+            u.replay_dir,
+            u.hotkey[K_REPLAY].0,
+            u.hotkey[K_REPLAY].1
         )
     });
     let p = config_path();
@@ -2173,12 +2449,9 @@ fn toggle() {
     }
 }
 
-fn start_recording() {
-    // 起動後に開いたゲームのウィンドウも拾えるよう、開始直前に一覧を取り直す
-    let preferred = UI.with(|u| u.borrow().preferred.clone());
-    refresh_sources(&[preferred, selected_source_name()]);
-    let path = new_file_path();
-    let settings = UI.with(|u| {
+/// いまの画面の設定から、取り込みの設定を作る（録画対象が無ければ None）
+fn current_settings() -> Option<Settings> {
+    UI.with(|u| {
         let u = u.borrow();
         let source = u.sources.get(u.src)?.source;
         Some(Settings {
@@ -2196,11 +2469,31 @@ fn start_recording() {
             mic: if u.mic == 0 { None } else { u.mics.get(u.mic - 1).map(|x| x.0.clone()) },
             codec: u.codecs.get(u.codec).copied().unwrap_or(Codec::H264),
             gpu: if u.gpu == 0 { None } else { u.gpus.get(u.gpu - 1).cloned() },
-        bitrate_kbps: u.bitrate.min(BR_MAX),
-            path: path.to_string_lossy().into_owned(),
+            bitrate_kbps: u.bitrate.min(BR_MAX),
         })
-    });
-    let Some(s) = settings else {
+    })
+}
+
+/// 取り込みが動いているあいだは 500ms ごとに tick する
+fn set_tick_timer(on: bool) {
+    let hwnd = UI.with(|u| u.borrow().hwnd);
+    unsafe {
+        if on {
+            SetTimer(Some(hwnd), TIMER, 500, None);
+        } else {
+            let _ = KillTimer(Some(hwnd), TIMER);
+        }
+    }
+}
+
+fn start_recording() {
+    // リプレイの保存中に取り込みを作り直すと書きかけになるので、先に終わらせる
+    wait_replay_save();
+    // 起動後に開いたゲームのウィンドウも拾えるよう、開始直前に一覧を取り直す
+    let preferred = UI.with(|u| u.borrow().preferred.clone());
+    refresh_sources(&[preferred, selected_source_name()]);
+    let path = new_file_path();
+    let Some(s) = current_settings() else {
         set_status(Status::Failed("開始できませんでした".into(), "録画できる画面が見つかりません".into()));
         invalidate_all();
         return;
@@ -2209,27 +2502,49 @@ fn start_recording() {
     save_config();
     set_status(Status::Starting);
     repaint_now();
-    match recorder::start(s) {
+    let (old, replay) = UI.with(|u| {
+        let mut u = u.borrow_mut();
+        let replay = u.replay_on.then_some(u.replay_secs);
+        (u.pipe.take(), replay)
+    });
+    let file = path.to_string_lossy().into_owned();
+    // 設定が同じなら、動いているリプレイの取り込みをそのまま使う（すぐ始まり、溜まった分も消えない）
+    let reuse = old.as_ref().is_some_and(|p| p.settings == s && p.error().is_none());
+    let res = if reuse {
+        let p = old.unwrap();
+        match p.start_file(&file) {
+            Ok(()) => Ok(p),
+            Err(e) => {
+                let _ = p.stop();
+                Err(e)
+            }
+        }
+    } else {
+        if let Some(p) = old {
+            let _ = p.stop();
+        }
+        recorder::start(s, Some(file), replay)
+    };
+    match res {
         Ok(r) => {
-            let hwnd = UI.with(|u| {
+            UI.with(|u| {
                 let mut u = u.borrow_mut();
                 u.info = r.info.clone();
-                u.rec = Some((r, Instant::now(), path));
+                u.replay_live = r.replay_secs().is_some();
+                u.pipe = Some(r);
+                u.rec = Some((Instant::now(), path));
                 u.status = Status::Recording;
                 u.elapsed = 0;
                 u.size_mb = 0.0;
                 u.blink = true;
-                u.hwnd
-            });
-            UI.with(|u| {
-                let mut u = u.borrow_mut();
                 u.fps_now = 0.0;
                 u.dropped = 0;
+                u.drop0 = stats::DROPPED.load(Ordering::Relaxed);
                 u.mbps = 0.0;
                 u.cpu = None;
                 u.gpu_load = None;
                 u.fps_hist.clear();
-                u.last_fresh = 0;
+                u.last_fresh = stats::FRESH.load(Ordering::Relaxed);
                 u.last_bytes = 0;
                 u.last_t = None;
                 u.meter = [0.0; 2];
@@ -2238,8 +2553,9 @@ fn start_recording() {
                 u.note = None;
             });
             sysmon::start();
+            set_tick_timer(true);
+            let hwnd = UI.with(|u| u.borrow().hwnd);
             unsafe {
-                SetTimer(Some(hwnd), TIMER, 500, None);
                 SetTimer(Some(hwnd), METER, 50, None);
             }
             update_tray(true);
@@ -2248,27 +2564,48 @@ fn start_recording() {
         Err(e) => {
             log(&format!("start: {e}"));
             let m = e.message();
+            UI.with(|u| u.borrow_mut().replay_live = false);
+            set_tick_timer(false);
             notify("開始できませんでした", &m);
             set_status(Status::Failed("開始できませんでした".into(), m));
+            // リプレイがオンなら、録画とは別に作り直す
+            schedule_sync();
         }
     }
     invalidate_all();
 }
 
 fn stop_recording() {
-    let Some((r, _, path)) = UI.with(|u| u.borrow_mut().rec.take()) else { return };
+    let Some((_, path)) = UI.with(|u| u.borrow_mut().rec.take()) else { return };
     let hwnd = UI.with(|u| u.borrow().hwnd);
     unsafe {
-        let _ = KillTimer(Some(hwnd), TIMER);
         let _ = KillTimer(Some(hwnd), METER);
     }
     sysmon::stop();
     set_status(Status::Saving);
     repaint_now();
-    let res = r.stop();
+    // リプレイを続けるなら録画ファイルだけ閉じる。そうでなければ取り込みごと止める
+    let pipe = UI.with(|u| u.borrow_mut().pipe.take());
+    let keep = UI.with(|u| u.borrow().replay_on) && pipe.as_ref().is_some_and(|p| p.error().is_none() && p.replay_secs().is_some());
+    let res = match pipe {
+        Some(p) if keep => {
+            let r = p.stop_file();
+            UI.with(|u| u.borrow_mut().pipe = Some(p));
+            r
+        }
+        Some(p) => {
+            UI.with(|u| u.borrow_mut().replay_live = false);
+            p.stop()
+        }
+        None => Ok(()),
+    };
+    if !keep {
+        set_tick_timer(false);
+    }
     let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     match res {
         Ok(()) => {
+            UI.with(|u| u.borrow_mut().notify_dir = Some(output_dir()));
             notify("録画を保存しました", &name);
             set_status(Status::Saved(name));
         }
@@ -2289,7 +2626,215 @@ fn stop_recording() {
     if UI.with(|u| u.borrow().tab) == Tab::List {
         refresh_list();
     }
+    if !keep {
+        schedule_sync();
+    }
     invalidate_all();
+}
+
+// ---- リプレイ ----
+
+fn replay_dir() -> PathBuf {
+    let d = UI.with(|u| u.borrow().replay_dir.clone());
+    if d.is_empty() { default_replay_dir() } else { PathBuf::from(d) }
+}
+
+/// 画面に出すリプレイの保存先（未設定なら既定のフォルダー）
+fn replay_dir_text(u: &Ui) -> String {
+    if u.replay_dir.is_empty() { default_replay_dir().display().to_string() } else { u.replay_dir.clone() }
+}
+
+fn default_replay_dir() -> PathBuf {
+    default_dir().join("Replays")
+}
+
+/// 設定が変わったことを記録し、少し待ってからリプレイを合わせる
+fn changed() {
+    save_config();
+    schedule_sync();
+}
+
+fn schedule_sync() {
+    let hwnd = UI.with(|u| {
+        let mut u = u.borrow_mut();
+        u.replay_fail = None;
+        u.hwnd
+    });
+    if !hwnd.is_invalid() {
+        unsafe { SetTimer(Some(hwnd), SYNC, 800, None) };
+    }
+}
+
+/// リプレイの取り込みを、いまの設定に合わせる（作る・作り直す・止める・秒数を変える）
+fn sync_replay() {
+    let hwnd = UI.with(|u| u.borrow().hwnd);
+    unsafe { let _ = KillTimer(Some(hwnd), SYNC); }
+    let (busy, recording, want, secs, failed) = UI.with(|u| {
+        let u = u.borrow();
+        (matches!(u.status, Status::Starting | Status::Saving) || u.replay_saving, u.rec.is_some(), u.replay_on, u.replay_secs, u.replay_fail.is_some())
+    });
+    if busy {
+        // 保存などが終わってからやり直す
+        unsafe { SetTimer(Some(hwnd), SYNC, 500, None) };
+        return;
+    }
+    // 録画中は取り込みを作り直さない。リプレイの付け外しと秒数だけ変える
+    if recording {
+        let r = UI.with(|u| u.borrow().pipe.as_ref().map(|p| p.set_replay(want.then_some(secs))));
+        if let Some(Err(e)) = r {
+            log(&format!("replay: {e}"));
+            UI.with(|u| u.borrow_mut().replay_fail = Some(e.message()));
+        }
+        let live = UI.with(|u| u.borrow().pipe.as_ref().is_some_and(|p| p.replay_secs().is_some()));
+        UI.with(|u| u.borrow_mut().replay_live = live);
+        invalidate_main();
+        return;
+    }
+    if !want {
+        if let Some(p) = UI.with(|u| u.borrow_mut().pipe.take()) {
+            let _ = p.stop();
+        }
+        UI.with(|u| u.borrow_mut().replay_live = false);
+        set_tick_timer(false);
+        invalidate_main();
+        return;
+    }
+    if failed {
+        return;
+    }
+    let Some(s) = current_settings() else {
+        UI.with(|u| u.borrow_mut().replay_fail = Some("録画できる画面が見つかりません".into()));
+        invalidate_main();
+        return;
+    };
+    let same = UI.with(|u| u.borrow().pipe.as_ref().map(|p| p.settings == s && p.error().is_none()));
+    if same == Some(true) {
+        let r = UI.with(|u| u.borrow().pipe.as_ref().map(|p| p.set_replay(Some(secs))));
+        if let Some(Err(e)) = r {
+            UI.with(|u| u.borrow_mut().replay_fail = Some(e.message()));
+        }
+        UI.with(|u| u.borrow_mut().replay_live = true);
+        invalidate_main();
+        return;
+    }
+    // 作り直す（溜まっていた分は消える）
+    let old = UI.with(|u| {
+        let mut u = u.borrow_mut();
+        u.replay_prep = true;
+        u.replay_live = false;
+        u.pipe.take()
+    });
+    repaint_now();
+    if let Some(p) = old {
+        let _ = p.stop();
+    }
+    let res = recorder::start(s, None, Some(secs));
+    let ok = res.is_ok();
+    UI.with(|u| {
+        let mut u = u.borrow_mut();
+        u.replay_prep = false;
+        match res {
+            Ok(p) => {
+                u.info = p.info.clone();
+                u.pipe = Some(p);
+                u.replay_live = true;
+                u.replay_buf = 0.0;
+            }
+            Err(e) => {
+                log(&format!("replay start: {e}"));
+                u.replay_fail = Some(e.message());
+            }
+        }
+    });
+    set_tick_timer(ok);
+    if !ok {
+        let m = UI.with(|u| u.borrow().replay_fail.clone()).unwrap_or_default();
+        notify("リプレイを開始できませんでした", &m);
+    }
+    invalidate_main();
+}
+
+const REPLAY_PREFIX: &str = "LightCaptureX_Replay_";
+
+static REPLAY_DONE: std::sync::Mutex<Option<(PathBuf, Result<crate::replay::Saved, String>)>> = std::sync::Mutex::new(None);
+
+fn new_replay_path() -> PathBuf {
+    let t = unsafe { GetLocalTime() };
+    replay_dir().join(format!(
+        "{REPLAY_PREFIX}{:04}{:02}{:02}_{:02}{:02}{:02}.mp4",
+        t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond
+    ))
+}
+
+/// 溜まっている映像を保存する。重いので別のスレッドで行い、終わったら WM_REPLAY が届く
+fn save_replay() {
+    let (hwnd, saver, on, saving) = UI.with(|u| {
+        let u = u.borrow();
+        (u.hwnd, u.pipe.as_ref().and_then(|p| p.replay_saver()), u.replay_on, u.replay_saving)
+    });
+    if saving {
+        return;
+    }
+    let Some(saver) = saver else {
+        if on {
+            notify("リプレイを準備しています", "少し待ってからもう一度押してください");
+        } else {
+            notify("リプレイはオフです", "設定タブの「リプレイバッファ」でオンにできます");
+        }
+        return;
+    };
+    let path = new_replay_path();
+    let _ = std::fs::create_dir_all(path.parent().unwrap());
+    UI.with(|u| u.borrow_mut().replay_saving = true);
+    invalidate_main();
+    let hwnd = hwnd.0 as isize;
+    std::thread::spawn(move || {
+        let r = saver.save(&path);
+        if let Ok(mut d) = REPLAY_DONE.lock() {
+            *d = Some((path, r));
+        }
+        unsafe { let _ = PostMessageW(Some(HWND(hwnd as *mut core::ffi::c_void)), WM_REPLAY, WPARAM(0), LPARAM(0)); }
+    });
+}
+
+fn replay_done() {
+    let Some((path, r)) = REPLAY_DONE.lock().ok().and_then(|mut d| d.take()) else { return };
+    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let msg = match &r {
+        Ok(sv) => format!("{:.0} 秒を保存しました", sv.secs),
+        Err(m) => format!("保存できませんでした: {m}"),
+    };
+    UI.with(|u| {
+        let mut u = u.borrow_mut();
+        u.replay_saving = false;
+        u.replay_msg = Some((msg, Instant::now()));
+        if r.is_ok() {
+            u.last_file = Some(path.clone());
+            u.notify_dir = Some(path.parent().map(Path::to_path_buf).unwrap_or_default());
+        }
+    });
+    match r {
+        Ok(sv) => notify("リプレイを保存しました", &format!("{name} · {:.0} 秒", sv.secs)),
+        Err(m) => notify("リプレイを保存できませんでした", &m),
+    }
+    if UI.with(|u| u.borrow().tab) == Tab::List {
+        refresh_list();
+    }
+    invalidate_main();
+}
+
+/// 終了前に、保存中のリプレイを待つ（書きかけのファイルを残さない）
+fn wait_replay_save() {
+    for _ in 0..150 {
+        if !UI.with(|u| u.borrow().replay_saving) {
+            return;
+        }
+        if REPLAY_DONE.lock().map(|d| d.is_some()).unwrap_or(true) {
+            replay_done();
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
 }
 
 const TIP: &str = "LightCaptureX";
@@ -2321,16 +2866,43 @@ fn window_visible() -> bool {
 }
 
 fn tick() {
+    // 取り込みが止まっていたら、録画中なら保存して止め、リプレイだけならリプレイを止める
+    let err = UI.with(|u| u.borrow().pipe.as_ref().and_then(|p| p.error()));
+    if let Some(e) = err {
+        log(&format!("pipeline: {e}"));
+        if UI.with(|u| u.borrow().rec.is_some()) {
+            stop_recording();
+        }
+        if let Some(p) = UI.with(|u| u.borrow_mut().pipe.take()) {
+            let _ = p.stop();
+            UI.with(|u| {
+                let mut u = u.borrow_mut();
+                u.replay_live = false;
+                u.replay_fail = Some(e.clone());
+            });
+            set_tick_timer(false);
+            notify("リプレイが止まりました", &e);
+        }
+        invalidate_all();
+        return;
+    }
     let fresh = stats::FRESH.load(Ordering::Relaxed);
     let dropped = stats::DROPPED.load(Ordering::Relaxed);
-    let (cpu, gpu) = sysmon::read();
     let now = Instant::now();
-    let blink = UI.with(|u| {
+    let recording = UI.with(|u| u.borrow().rec.is_some());
+    let (cpu, gpu) = if recording { sysmon::read() } else { (None, None) };
+    let (blink, resync) = UI.with(|u| {
         let mut u = u.borrow_mut();
-        let (secs, path) = match &u.rec {
-            Some((_, t, p)) => (t.elapsed().as_secs(), p.clone()),
-            None => return None,
+        u.tick_n = u.tick_n.wrapping_add(1);
+        u.replay_buf = u.pipe.as_ref().map_or(0.0, |p| p.replay_buffered());
+        if u.replay_msg.as_ref().is_some_and(|m| m.1.elapsed().as_secs() >= 5) {
+            u.replay_msg = None;
+        }
+        let Some((t, path)) = u.rec.clone() else {
+            // リプレイだけのとき: ときどき録画対象の一覧を見直す（ウィンドウが閉じた・開いたなど）
+            return (None, u.replay_on && u.tick_n % 20 == 0 && u.status != Status::Starting);
         };
+        let secs = t.elapsed().as_secs();
         let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
         let dt = u.last_t.map_or(0.5, |l| now.duration_since(l).as_secs_f32()).max(0.05);
         u.fps_now = fresh.saturating_sub(u.last_fresh) as f32 / dt;
@@ -2338,7 +2910,7 @@ fn tick() {
         u.last_fresh = fresh;
         u.last_bytes = size;
         u.last_t = Some(now);
-        u.dropped = dropped;
+        u.dropped = dropped.saturating_sub(u.drop0);
         u.cpu = cpu;
         u.gpu_load = gpu;
         let f = u.fps_now;
@@ -2349,10 +2921,18 @@ fn tick() {
         u.elapsed = secs;
         u.size_mb = size as f64 / 1_048_576.0;
         u.blink = !u.blink;
-        Some(u.blink)
+        (Some(u.blink), false)
     });
     if let Some(b) = blink {
         update_tray(b);
+    }
+    if resync {
+        let before = selected_source_name();
+        let preferred = UI.with(|u| u.borrow().preferred.clone());
+        refresh_sources(&[preferred, before.clone()]);
+        if selected_source_name() != before {
+            schedule_sync();
+        }
     }
     if window_visible() {
         invalidate_main();
@@ -2398,8 +2978,18 @@ fn show_in_folder(f: &Path) {
 
 fn refresh_list() {
     let dir = output_dir();
-    let skip = UI.with(|u| u.borrow().rec.as_ref().map(|r| r.2.clone()));
-    let list = recs::scan(&dir, skip.as_deref());
+    let skip = UI.with(|u| u.borrow().rec.as_ref().map(|r| r.1.clone()));
+    let mut list = recs::scan(&dir, skip.as_deref());
+    // リプレイのフォルダーが別なら、そちらの動画も同じ一覧に混ぜる（新しい順）
+    let rdir = replay_dir();
+    if rdir != dir {
+        list.extend(recs::scan(&rdir, None));
+        list.sort_by(|a, b| b.mtime.cmp(&a.mtime));
+        list.truncate(500);
+    }
+    for e in &mut list {
+        e.replay = e.name.starts_with(REPLAY_PREFIX);
+    }
     let free = recs::free_bytes(&dir);
     UI.with(|u| {
         let mut u = u.borrow_mut();
@@ -2472,67 +3062,89 @@ fn pick_folder(owner: HWND, start: &str) -> Option<PathBuf> {
 
 // ---- ショートカット ----
 
-fn hotkey_reg(hwnd: HWND, hk: (u32, u32)) -> bool {
+fn hotkey_reg(hwnd: HWND, k: usize, hk: (u32, u32)) -> bool {
     unsafe {
-        let _ = UnregisterHotKey(Some(hwnd), HOTKEY);
-        RegisterHotKey(Some(hwnd), HOTKEY, HOT_KEY_MODIFIERS(hk.0) | MOD_NOREPEAT, hk.1).is_ok()
+        let _ = UnregisterHotKey(Some(hwnd), HOTKEYS[k]);
+        RegisterHotKey(Some(hwnd), HOTKEYS[k], HOT_KEY_MODIFIERS(hk.0) | MOD_NOREPEAT, hk.1).is_ok()
     }
 }
 
-fn start_capture() {
+/// 2つのショートカットを登録し直す。リプレイ保存のキーはリプレイがオンのときだけ持っておく
+fn register_keys() {
+    let (hwnd, hk, replay) = UI.with(|u| {
+        let u = u.borrow();
+        (u.hwnd, u.hotkey, u.replay_on)
+    });
+    if hwnd.is_invalid() {
+        return;
+    }
+    let ok0 = hotkey_reg(hwnd, K_REC, hk[K_REC]);
+    let ok1 = hotkey_reg(hwnd, K_REPLAY, hk[K_REPLAY]);
+    if !replay {
+        // オフのときも、ほかのアプリと重なっていないかだけは確かめておく
+        unsafe { let _ = UnregisterHotKey(Some(hwnd), HOTKEYS[K_REPLAY]); }
+    }
+    UI.with(|u| u.borrow_mut().hotkey_ok = [ok0, ok1]);
+}
+
+fn unregister_keys(hwnd: HWND) {
+    for id in HOTKEYS {
+        unsafe { let _ = UnregisterHotKey(Some(hwnd), id); }
+    }
+}
+
+fn start_capture(k: usize) {
     let hwnd = UI.with(|u| {
         let mut u = u.borrow_mut();
-        u.capturing = true;
+        u.capturing = Some(k);
         u.note = None;
         u.hwnd
     });
-    // 入力待ちのあいだに、いまのキーが録画を始めてしまわないよう外しておく
-    unsafe { let _ = UnregisterHotKey(Some(hwnd), HOTKEY); }
+    // 入力待ちのあいだに、いまのキーが録画や保存を始めてしまわないよう外しておく
+    unregister_keys(hwnd);
 }
 
 /// 入力待ちをやめて、いまのショートカットを登録し直す
 fn cancel_capture() {
-    if !UI.with(|u| u.borrow().capturing) {
+    if UI.with(|u| u.borrow_mut().capturing.take()).is_none() {
         return;
     }
-    let (hwnd, hk) = UI.with(|u| (u.borrow().hwnd, u.borrow().hotkey));
-    let ok = hotkey_reg(hwnd, hk);
-    UI.with(|u| {
-        let mut u = u.borrow_mut();
-        u.capturing = false;
-        u.hotkey_ok = ok;
-    });
+    register_keys();
     invalidate_main();
 }
 
-fn apply_hotkey(hk: (u32, u32)) {
-    let (hwnd, old) = UI.with(|u| (u.borrow().hwnd, u.borrow().hotkey));
-    if hotkey_reg(hwnd, hk) {
-        UI.with(|u| {
-            let mut u = u.borrow_mut();
-            u.hotkey = hk;
-            u.hotkey_ok = true;
-            u.capturing = false;
-            u.note = Some(format!("{} に変更しました", key_text(hk)));
-        });
-        save_config();
+fn apply_hotkey(k: usize, hk: (u32, u32)) {
+    let other = UI.with(|u| u.borrow().hotkey[1 - k]);
+    let note = if other == hk {
+        Some("もう一方のショートカットと同じキーです".to_string())
     } else {
-        let ok = hotkey_reg(hwnd, old);
-        UI.with(|u| {
-            let mut u = u.borrow_mut();
-            u.hotkey_ok = ok;
-            u.capturing = false;
-            u.note = Some("そのキーはほかのアプリが使っています".into());
-        });
+        let (hwnd, replay) = UI.with(|u| (u.borrow().hwnd, u.borrow().replay_on));
+        if hotkey_reg(hwnd, k, hk) {
+            if k == K_REPLAY && !replay {
+                unsafe { let _ = UnregisterHotKey(Some(hwnd), HOTKEYS[k]); }
+            }
+            UI.with(|u| u.borrow_mut().hotkey[k] = hk);
+            None
+        } else {
+            Some("そのキーはほかのアプリが使っています".to_string())
+        }
+    };
+    let ok = note.is_none();
+    UI.with(|u| {
+        let mut u = u.borrow_mut();
+        u.capturing = None;
+        u.note = Some(note.unwrap_or_else(|| format!("{} に変更しました", key_text(hk))));
+    });
+    register_keys();
+    if ok {
+        save_config();
     }
     invalidate_main();
 }
 
 /// 入力待ちのとき、押されたキーをショートカットにする。処理したら true
 fn capture_key(vk: u32) -> bool {
-    if !UI.with(|u| u.borrow().capturing) {
-        return false;
-    }
+    let Some(k) = UI.with(|u| u.borrow().capturing) else { return false };
     // 修飾キーだけでは決めない
     if matches!(vk, 0x10 | 0x11 | 0x12 | 0x5B | 0x5C | 0xA0..=0xA5) {
         return true;
@@ -2552,8 +3164,31 @@ fn capture_key(vk: u32) -> bool {
         invalidate_main();
         return true;
     }
-    apply_hotkey((mods, vk));
+    apply_hotkey(k, (mods, vk));
     true
+}
+
+/// 登録できなかったショートカットでも、このウィンドウが前にあれば効かせる
+fn fallback_hotkey(vk: u32) -> bool {
+    let down = |k: VIRTUAL_KEY| unsafe { GetKeyState(k.0 as i32) } < 0;
+    let mut mods = 0u32;
+    if down(VK_CONTROL) { mods |= MOD_CONTROL.0; }
+    if down(VK_MENU) { mods |= MOD_ALT.0; }
+    if down(VK_SHIFT) { mods |= MOD_SHIFT.0; }
+    if down(VK_LWIN) || down(VK_RWIN) { mods |= MOD_WIN.0; }
+    let (hk, ok, replay) = UI.with(|u| {
+        let u = u.borrow();
+        (u.hotkey, u.hotkey_ok, u.replay_on)
+    });
+    if !ok[K_REC] && hk[K_REC] == (mods, vk) {
+        toggle();
+        return true;
+    }
+    if replay && !ok[K_REPLAY] && hk[K_REPLAY] == (mods, vk) {
+        save_replay();
+        return true;
+    }
+    false
 }
 
 fn open_folder() {
@@ -2572,7 +3207,7 @@ fn open_folder() {
 // ---- 操作 ----
 
 fn save_and_repaint() {
-    save_config();
+    changed();
     invalidate_main();
 }
 
@@ -2673,18 +3308,48 @@ fn activate(h: Hit) {
             let _ = std::fs::create_dir_all(&dir);
             open_path(&dir);
         }
-        Ctl::SetKey => {
-            if UI.with(|u| u.borrow().capturing) {
+        Ctl::SetKey | Ctl::SetRKey => {
+            let k = if h.ctl == Ctl::SetKey { K_REC } else { K_REPLAY };
+            if UI.with(|u| u.borrow().capturing) == Some(k) {
                 cancel_capture();
             } else {
-                start_capture();
+                start_capture(k);
             }
             invalidate_main();
         }
-        Ctl::SetKeyReset => {
-            cancel_capture();
-            apply_hotkey((0, VK_F9.0 as u32));
+        Ctl::SetKeyReset | Ctl::SetRKeyReset => {
+            let k = if h.ctl == Ctl::SetKeyReset { K_REC } else { K_REPLAY };
+            UI.with(|u| u.borrow_mut().capturing = None);
+            apply_hotkey(k, KEY_DEFAULT[k]);
         }
+        Ctl::SetRDir => {
+            let (hwnd, cur) = UI.with(|u| (u.borrow().hwnd, replay_dir().display().to_string()));
+            if let Some(d) = pick_folder(hwnd, &cur) {
+                UI.with(|u| {
+                    let mut u = u.borrow_mut();
+                    u.replay_dir = d.display().to_string();
+                    u.list_off = 0;
+                    u.note = None;
+                });
+                refresh_list();
+            }
+            save_and_repaint();
+        }
+        Ctl::SetRDirOpen => {
+            let dir = replay_dir();
+            let _ = std::fs::create_dir_all(&dir);
+            open_path(&dir);
+        }
+        Ctl::ReplayTog => {
+            UI.with(|u| {
+                let mut u = u.borrow_mut();
+                u.replay_on = !u.replay_on;
+                u.replay_msg = None;
+            });
+            register_keys();
+            save_and_repaint();
+        }
+        Ctl::ReplaySave => save_replay(),
         Ctl::TogTray => {
             UI.with(|u| {
                 let mut u = u.borrow_mut();
@@ -2750,7 +3415,7 @@ fn activate(h: Hit) {
 }
 
 fn on_key(vk: VIRTUAL_KEY) {
-    let (focus, hotkey_ok, hk) = UI.with(|u| (u.borrow().focus, u.borrow().hotkey_ok, u.borrow().hotkey));
+    let focus = UI.with(|u| u.borrow().focus);
     if vk == VK_TAB {
         let back = unsafe { GetKeyState(VK_SHIFT.0 as i32) } < 0;
         UI.with(|u| {
@@ -2774,8 +3439,7 @@ fn on_key(vk: VIRTUAL_KEY) {
         return;
     }
     // ショートカットが登録できなかったときは、ウィンドウが前面のあいだだけキーで代用する
-    if hk.0 == 0 && vk.0 as u32 == hk.1 && !hotkey_ok {
-        toggle();
+    if fallback_hotkey(vk.0 as u32) {
         return;
     }
     let Some(c) = focus.filter(|&c| UI.with(|u| enabled(&u.borrow(), c))) else { return };
@@ -2787,12 +3451,14 @@ fn on_key(vk: VIRTUAL_KEY) {
             let step = match (c, big) {
                 (Ctl::Bitrate, true) => 5000,
                 (Ctl::Bitrate, false) => BR_STEP,
+                (Ctl::ReplaySecs, true) => 30,
+                (Ctl::ReplaySecs, false) => RP_STEP,
                 (_, true) => 10,
                 _ => 1,
             };
             let v = if vk == VK_LEFT || vk == VK_DOWN { v.saturating_sub(step) } else { v + step };
             set_slider(c, v);
-            save_config();
+            changed();
         } else if is_seg(c) {
             let v = UI.with(|u| seg_value(&u.borrow(), c));
             let v = if vk == VK_LEFT || vk == VK_UP { v.saturating_sub(1) } else { v + 1 };
@@ -2904,8 +3570,15 @@ fn init_values() {
         u.cursor = num("cursor", 1) != 0;
         u.apps = apps.clone();
         u.out_dir = cfg(&c, "dir").filter(|d| !d.is_empty()).map(String::from).unwrap_or_else(|| dflt.display().to_string());
-        let hk = cfg(&c, "hotkey").and_then(|v| v.split_once(',')).and_then(|(m, k)| Some((m.parse::<u32>().ok()?, k.parse::<u32>().ok()?)));
-        u.hotkey = hk.filter(|h| h.1 != 0).unwrap_or((0, VK_F9.0 as u32));
+        let key = |name: &str| cfg(&c, name).and_then(|v| v.split_once(',')).and_then(|(m, k)| Some((m.parse::<u32>().ok()?, k.parse::<u32>().ok()?))).filter(|h| h.1 != 0);
+        u.hotkey[K_REC] = key("hotkey").unwrap_or(KEY_DEFAULT[K_REC]);
+        // 2つが同じキーになっていたら、リプレイ側を既定に戻す（既定も重なるなら録画の既定を使う）
+        let r = key("replay_hotkey").unwrap_or(KEY_DEFAULT[K_REPLAY]);
+        u.hotkey[K_REPLAY] = if r != u.hotkey[K_REC] { r } else if KEY_DEFAULT[K_REPLAY] != u.hotkey[K_REC] { KEY_DEFAULT[K_REPLAY] } else { KEY_DEFAULT[K_REC] };
+        u.replay_on = num("replay", 0) != 0;
+        let rs = num("replay_secs", 30) as u32;
+        u.replay_secs = (rs / RP_STEP * RP_STEP).clamp(RP_MIN, RP_MAX);
+        u.replay_dir = cfg(&c, "replay_dir").unwrap_or("").to_string();
         u.tray_close = num("tray_close", 1) != 0;
         u.notify = num("notify", 1) != 0;
         u.auto_update = num("auto_update", 1) != 0;
@@ -2956,12 +3629,13 @@ fn tray_menu() {
         let u = u.borrow();
         let rec = u.status == Status::Recording;
         let busy = matches!(u.status, Status::Starting | Status::Saving);
-        let hk = if u.hotkey_ok { format!("\t{}", key_text(u.hotkey)) } else { String::new() };
-        let mut v = vec![
-            Item::cmd(1, format!("{}{hk}", if rec { "録画を停止" } else { "録画を開始" })).on(!busy),
-            Item::cmd(2, "ウィンドウを開く"),
-            Item::Sep,
-        ];
+        let key = |k: usize| if u.hotkey_ok[k] { format!("\t{}", key_text(u.hotkey[k])) } else { String::new() };
+        let mut v = vec![Item::cmd(1, format!("{}{}", if rec { "録画を停止" } else { "録画を開始" }, key(K_REC))).on(!busy)];
+        if u.replay_on {
+            v.push(Item::cmd(5, format!("リプレイを保存{}", key(K_REPLAY))).on(u.replay_live && !u.replay_saving));
+        }
+        v.push(Item::cmd(2, "ウィンドウを開く"));
+        v.push(Item::Sep);
         let recent: Vec<Item> = if u.list.is_empty() {
             vec![Item::cmd(0, "（まだありません）").on(false)]
         } else {
@@ -2995,6 +3669,7 @@ fn tray_menu() {
         let audio = vec![Item::sub("PC の音", seg(Ctl::Sys, 710, u.sys)), Item::sub("マイク", mic)];
         v.push(Item::sub("音声", audio).on(idle));
         v.push(Item::Sep);
+        v.push(Item::cmd(802, "リプレイバッファ").checked(u.replay_on));
         v.push(Item::cmd(800, "トレーから通知する").checked(u.notify));
         v.push(Item::cmd(801, "×で閉じたらトレーに残す").checked(u.tray_close));
         v.push(Item::Sep);
@@ -3012,6 +3687,7 @@ fn tray_cmd(hwnd: HWND, id: u32) {
     match id {
         1 => toggle(),
         2 => show_window(),
+        5 => save_replay(),
         3 => {
             show_window();
             set_value(Ctl::Tab, 1);
@@ -3057,16 +3733,27 @@ fn tray_cmd(hwnd: HWND, id: u32) {
         }
         800 => activate(Hit { ctl: Ctl::TogNotify, idx: 0 }),
         801 => activate(Hit { ctl: Ctl::TogTray, idx: 0 }),
+        802 => activate(Hit { ctl: Ctl::ReplayTog, idx: 0 }),
         850 => activate(Hit { ctl: Ctl::UpdBtn, idx: 0 }),
         900 => quit(hwnd),
         _ => {}
     }
 }
 
+/// 保存中のリプレイを待ってから、取り込みを止める（一時ファイルもここで消える）
+fn shutdown_pipe() {
+    wait_replay_save();
+    if let Some(p) = UI.with(|u| u.borrow_mut().pipe.take()) {
+        let _ = p.stop();
+    }
+    UI.with(|u| u.borrow_mut().replay_live = false);
+}
+
 /// 録画を止めて保存し、トレーのアイコンを消して終わる
 fn quit(hwnd: HWND) {
     tray::remove(hwnd);
     stop_recording();
+    shutdown_pipe();
     save_config();
     unsafe { let _ = DestroyWindow(hwnd); }
 }
@@ -3082,14 +3769,13 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
                 u.dpi = d;
             });
             init_values();
-            let hk = UI.with(|u| u.borrow().hotkey);
-            let ok = hotkey_reg(hwnd, hk);
-            UI.with(|u| {
-                let mut u = u.borrow_mut();
-                u.hotkey_ok = ok;
-                u.tray_on = true;
-            });
+            register_keys();
+            UI.with(|u| u.borrow_mut().tray_on = true);
             tray::add(hwnd, TIP);
+            // リプレイがオンなら、ウィンドウが出てから取り込みを始める
+            if UI.with(|u| u.borrow().replay_on) {
+                unsafe { SetTimer(Some(hwnd), SYNC, 300, None) };
+            }
             LRESULT(0)
         }
         WM_PAINT => {
@@ -3168,7 +3854,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
                 if let Some(h) = h {
                     u.focus = Some(h.ctl);
                     if let Some(v) = on_value {
-                        let now = if v.ctl == Ctl::Fps { u.fps } else { u.bitrate };
+                        let now = slider_value(&u, v.ctl);
                         u.edit = Some((v.ctl, now.to_string()));
                     } else if is_slider(h.ctl) {
                         u.drag = Some(h.ctl);
@@ -3263,12 +3949,19 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
         }
         WM_KEYDOWN | WM_SYSKEYDOWN => {
             commit_edit();
-            if !capture_key(wp.0 as u32) && msg == WM_KEYDOWN {
-                on_key(VIRTUAL_KEY(wp.0 as u16));
-            } else if !UI.with(|u| u.borrow().capturing) && msg == WM_SYSKEYDOWN {
-                return unsafe { DefWindowProcW(hwnd, msg, wp, lp) };
+            let vk = wp.0 as u32;
+            if capture_key(vk) {
+                return LRESULT(0);
             }
-            LRESULT(0)
+            if msg == WM_KEYDOWN {
+                on_key(VIRTUAL_KEY(vk as u16));
+                return LRESULT(0);
+            }
+            // Alt 付きのキーや F10 は WM_SYSKEYDOWN で届く
+            if fallback_hotkey(vk) {
+                return LRESULT(0);
+            }
+            unsafe { DefWindowProcW(hwnd, msg, wp, lp) }
         }
         WM_ACTIVATEAPP if wp.0 == 0 => {
             commit_edit();
@@ -3304,7 +3997,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
                 WM_RBUTTONUP | WM_CONTEXTMENU => tray_menu(),
                 // 通知を押したら保存先を開く
                 x if x == WM_USER + 5 => {
-                    let dir = output_dir();
+                    let dir = UI.with(|u| u.borrow().notify_dir.clone()).unwrap_or_else(output_dir);
                     open_path(&dir);
                 }
                 _ => {}
@@ -3322,21 +4015,30 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
             if wp.0 != 0 {
                 tray::remove(hwnd);
                 stop_recording();
+                shutdown_pipe();
                 save_config();
             }
             LRESULT(0)
         }
-        WM_HOTKEY if wp.0 as i32 == HOTKEY => {
+        WM_HOTKEY if wp.0 as i32 == HOTKEYS[K_REC] => {
             // 一覧を開いたまま録画を始めると、古い一覧の番号が設定に入るので先に閉じる
             pop_finish(None);
             toggle();
             LRESULT(0)
         }
+        WM_HOTKEY if wp.0 as i32 == HOTKEYS[K_REPLAY] => {
+            save_replay();
+            LRESULT(0)
+        }
+        WM_REPLAY => {
+            replay_done();
+            LRESULT(0)
+        }
         WM_TIMER => {
-            if wp.0 == METER {
-                meter_tick();
-            } else {
-                tick();
+            match wp.0 {
+                METER => meter_tick(),
+                SYNC => sync_replay(),
+                _ => tick(),
             }
             LRESULT(0)
         }
@@ -3358,7 +4060,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
         }
         WM_DESTROY => {
             unsafe {
-                let _ = UnregisterHotKey(Some(hwnd), HOTKEY);
+                unregister_keys(hwnd);
                 PostQuitMessage(0);
             }
             LRESULT(0)
@@ -3453,7 +4155,7 @@ pub fn render_ui(dir: &str) {
     UI.with(|u| {
         let mut u = u.borrow_mut();
         u.dpi = 96;
-        u.hotkey_ok = true;
+        u.hotkey_ok = [true; 2];
     });
     init_values();
     let (base_sys, base_apps) = UI.with(|u| (u.borrow().sys, u.borrow().apps.clone()));
@@ -3462,12 +4164,19 @@ pub fn render_ui(dir: &str) {
     remember_icons(&entries);
     // 実際のフォルダーは読まず、見本の一覧と保存先を使う
     let demo_list: Vec<RecEntry> = (0..9)
-        .map(|i| RecEntry {
-            path: PathBuf::from(format!("C:\\Videos\\LightCaptureX\\LightCaptureX_20261020_{:02}0000.mp4", 22 - i)),
-            name: format!("LightCaptureX_20261020_{:02}0000.mp4", 22 - i),
-            size: 900_000_000 / (i as u64 + 1),
-            secs: if i == 3 { None } else { Some(2400 / (i as u64 + 1)) },
-            when: (2026, 10, 20, 22 - i as u16, 0),
+        .map(|i| {
+            // 1 本目と 4 本目はリプレイ
+            let replay = i == 0 || i == 4;
+            let name = if replay { format!("{REPLAY_PREFIX}20261020_{:02}0000.mp4", 22 - i) } else { format!("LightCaptureX_20261020_{:02}0000.mp4", 22 - i) };
+            RecEntry {
+                path: PathBuf::from(format!("C:\\Videos\\LightCaptureX\\{name}")),
+                name,
+                size: if replay { 120_000_000 } else { 900_000_000 / (i as u64 + 1) },
+                secs: if i == 3 { None } else if replay { Some(30) } else { Some(2400 / (i as u64 + 1)) },
+                when: (2026, 10, 20, 22 - i as u16, 0),
+                mtime: 0,
+                replay,
+            }
         })
         .collect();
     let demo_dir = "D:\\Recordings\\Games\\LightCaptureX".to_string();
@@ -3530,8 +4239,26 @@ pub fn render_ui(dir: &str) {
         ("list-hover", Box::new(|u| { u.tab = Tab::List; u.hover = Some(Hit { ctl: Ctl::ListDel, idx: 1 }); u.list_off = 0; }), None),
         ("list-empty", Box::new(|u| { u.tab = Tab::List; u.list.clear(); }), None),
         ("settings", Box::new(|u| u.tab = Tab::Set), None),
-        ("settings-capture", Box::new(|u| { u.tab = Tab::Set; u.capturing = true; u.hover = Some(Hit { ctl: Ctl::SetKey, idx: 0 }); }), None),
-        ("settings-note", Box::new(|u| { u.tab = Tab::Set; u.tray_close = false; u.note = Some("そのキーはほかのアプリが使っています".into()); u.hotkey = (MOD_CONTROL.0 | MOD_SHIFT.0, 0x52); }), None),
+        ("settings-capture", Box::new(|u| { u.tab = Tab::Set; u.capturing = Some(K_REC); u.hover = Some(Hit { ctl: Ctl::SetKey, idx: 0 }); }), None),
+        ("settings-capture2", Box::new(|u| { u.tab = Tab::Set; u.replay_on = true; u.capturing = Some(K_REPLAY); u.hover = Some(Hit { ctl: Ctl::SetRKey, idx: 0 }); }), None),
+        ("settings-note", Box::new(|u| { u.tab = Tab::Set; u.tray_close = false; u.note = Some("そのキーはほかのアプリが使っています".into()); u.hotkey[K_REC] = (MOD_CONTROL.0 | MOD_SHIFT.0, 0x52); }), None),
+        ("settings-replay", Box::new(|u| { u.tab = Tab::Set; u.replay_on = true; u.replay_live = true; u.replay_buf = 30.0; u.replay_secs = 120; u.replay_dir = "D:\\Recordings\\Games\\LightCaptureX\\Replays".into(); u.hotkey_ok[K_REPLAY] = false; }), None),
+        ("replay-idle", Box::new(|u| { u.replay_on = true; u.replay_live = true; u.replay_buf = 24.0; }), None),
+        ("replay-full", Box::new(|u| { u.replay_on = true; u.replay_live = true; u.replay_buf = 30.0; u.hover = Some(Hit { ctl: Ctl::ReplaySave, idx: 0 }); }), None),
+        ("replay-saving", Box::new(|u| { u.replay_on = true; u.replay_live = true; u.replay_buf = 30.0; u.replay_saving = true; }), None),
+        ("replay-saved", Box::new(|u| { u.replay_on = true; u.replay_live = true; u.replay_buf = 30.0; u.replay_msg = Some(("30 秒を保存しました".into(), Instant::now())); }), None),
+        ("replay-prep", Box::new(|u| { u.replay_on = true; u.replay_prep = true; }), None),
+        ("replay-failed", Box::new(|u| { u.replay_on = true; u.replay_fail = Some("エンコーダを用意できませんでした".into()); }), None),
+        ("replay-recording", Box::new(|u| {
+            u.replay_on = true;
+            u.replay_live = true;
+            u.replay_buf = 30.0;
+            u.status = Status::Recording;
+            u.elapsed = 754;
+            u.size_mb = 1284.6;
+            u.blink = true;
+            u.info = "GeForce RTX 4070 / H.264 Encoder".into();
+        }), None),
         ("starting", Box::new(|u| u.status = Status::Starting), None),
         (
             "error",
@@ -3558,10 +4285,20 @@ pub fn render_ui(dir: &str) {
                 u.apps = base_apps.clone();
                 u.open = *open;
                 u.tab = Tab::Rec;
-                u.capturing = false;
+                u.capturing = None;
                 u.note = None;
                 u.tray_close = true;
-                u.hotkey = (0, VK_F9.0 as u32);
+                u.hotkey = KEY_DEFAULT;
+                u.hotkey_ok = [true; 2];
+                u.replay_on = false;
+                u.replay_live = false;
+                u.replay_buf = 0.0;
+                u.replay_secs = 30;
+                u.replay_saving = false;
+                u.replay_prep = false;
+                u.replay_fail = None;
+                u.replay_msg = None;
+                u.replay_dir = String::new();
                 u.out_dir = demo_dir.clone();
                 u.free = Some(412_000_000_000);
                 u.list = demo_list.clone();

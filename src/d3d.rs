@@ -104,3 +104,25 @@ pub fn create_device(adapter: Option<&IDXGIAdapter1>) -> Result<(ID3D11Device, I
     }
     Ok((device, ctx.unwrap()))
 }
+
+/// プロセス全体の GPU スケジューリングの優先度を上げる（OBS と同じ手法）。
+/// ゲームが GPU を使い切っていても、取り込み・変換・エンコードの短い処理を先に回してもらう
+pub fn raise_gpu_priority() {
+    use std::sync::Once;
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| unsafe {
+        use windows::core::{s, w};
+        use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
+        use windows::Win32::System::Threading::GetCurrentProcess;
+        let Ok(gdi) = LoadLibraryW(w!("gdi32.dll")) else { return };
+        let Some(f) = GetProcAddress(gdi, s!("D3DKMTSetProcessSchedulingPriorityClass")) else { return };
+        let f: extern "system" fn(windows::Win32::Foundation::HANDLE, i32) -> i32 = std::mem::transmute(f);
+        // 4=HIGH, 3=ABOVE_NORMAL（REALTIME は画面全体を固まらせることがあるので使わない）
+        for class in [4, 3] {
+            if f(GetCurrentProcess(), class) >= 0 {
+                crate::log(&format!("gpu scheduling priority class: {class}"));
+                return;
+            }
+        }
+    });
+}

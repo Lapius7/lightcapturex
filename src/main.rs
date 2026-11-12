@@ -10,6 +10,7 @@ mod gfx;
 mod gui;
 mod recorder;
 mod recs;
+mod replay;
 mod stats;
 mod sysmon;
 mod tray;
@@ -103,16 +104,60 @@ fn cli(args: &[String]) {
         },
         gpu: get("--gpu"),
         bitrate_kbps: get("--kbps").and_then(|v| v.parse().ok()).or_else(|| get("--mbps").and_then(|v| v.parse::<u32>().ok().map(|m| m * 1000))).unwrap_or(0),
-        path: get("--out").unwrap_or_else(|| "capture.mp4".into()),
     };
     let secs: f64 = get("--seconds").and_then(|v| v.parse().ok()).unwrap_or(5.0);
-    log(&format!("recording '{}' -> {}", src.name, settings.path));
-    match recorder::start(settings) {
+    // リプレイの試験: --replay 秒数 --save-at 3,8 --replay-out フォルダ
+    // 途中から録画する試験: --file-at 開始-終了（秒）
+    let replay: Option<u32> = get("--replay").and_then(|v| v.parse().ok());
+    let list = |k: &str| -> Vec<f64> { get(k).map(|v| v.split([',', '-']).filter_map(|x| x.parse().ok()).collect()).unwrap_or_default() };
+    let file_at = list("--file-at");
+    let out = get("--out").or_else(|| (replay.is_none() && file_at.is_empty()).then(|| "capture.mp4".into()));
+    let replay_dir = std::path::PathBuf::from(get("--replay-out").unwrap_or_else(|| ".".into()));
+    // 実行する操作（秒, 種類）を時刻順に並べる
+    let mut events: Vec<(f64, u8)> = list("--save-at").into_iter().map(|t| (t, 0)).collect();
+    if let [a, b] = file_at[..] {
+        events.extend([(a, 1), (b, 2)]);
+    }
+    events.sort_by(|x, y| x.0.total_cmp(&y.0));
+    log(&format!("recording '{}' -> {:?}, replay: {replay:?}", src.name, out));
+    let file_path = get("--out").unwrap_or_else(|| "capture.mp4".into());
+    match recorder::start(settings, out.clone().filter(|_| file_at.is_empty()), replay) {
         Ok(r) => {
             let c0 = cpu_time();
-            std::thread::sleep(std::time::Duration::from_secs_f64(secs));
+            let t0 = std::time::Instant::now();
+            let wait = |t: f64| {
+                let left = t - t0.elapsed().as_secs_f64();
+                if left > 0.0 {
+                    std::thread::sleep(std::time::Duration::from_secs_f64(left));
+                }
+            };
+            for (k, (t, kind)) in events.iter().enumerate() {
+                wait(*t);
+                match kind {
+                    0 => {
+                        let path = replay_dir.join(format!("replay-{k}.mp4"));
+                        let s0 = std::time::Instant::now();
+                        match r.replay_saver().map(|s| s.save(&path)) {
+                            Some(Ok(v)) => log(&format!("save {}: {:.2}s in {} ms", v.path.display(), v.secs, s0.elapsed().as_millis())),
+                            Some(Err(e)) => log(&format!("save error: {e}")),
+                            None => log("replay is off"),
+                        }
+                    }
+                    1 => log(&format!("start_file: {:?}", r.start_file(&file_path))),
+                    _ => log(&format!("stop_file: {:?}", r.stop_file())),
+                }
+            }
+            wait(secs);
             // 録画中のプロセス全体の CPU 使用量（1 コアを 100% とする）
             log(&format!("cpu: {:.2}% of one core", (cpu_time() - c0) / secs * 100.0));
+            log(&format!(
+                "frames: fresh {} / dropped {}",
+                stats::FRESH.load(std::sync::atomic::Ordering::Relaxed),
+                stats::DROPPED.load(std::sync::atomic::Ordering::Relaxed)
+            ));
+            if let Some(e) = r.error() {
+                log(&format!("pipeline error: {e}"));
+            }
             match r.stop() {
                 Ok(()) => log("done"),
                 Err(e) => log(&format!("stop error: {e}")),

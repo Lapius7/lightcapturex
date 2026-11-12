@@ -1,10 +1,10 @@
 //! WASAPI で PC の音（全体、または選んだアプリだけ）とマイクを取り込み、1 本のステレオトラックにミックスする。
-use crate::encoder::{Encoder, AUDIO_CH, AUDIO_RATE};
+use crate::encoder::{AUDIO_CH, AUDIO_RATE};
 use crate::log;
 use crate::recorder::{qpc, qpf, Sleeper};
 use std::collections::{HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use windows::core::{implement, Interface, Ref, Result, HRESULT, HSTRING};
 use windows::Win32::Devices::FunctionDiscovery::PKEY_Device_FriendlyName;
 use windows::Win32::Foundation::{CloseHandle, E_FAIL, HANDLE, WAIT_OBJECT_0};
@@ -284,9 +284,11 @@ fn open_apps(apps: &[String], inputs: &mut Vec<Input>, opened: &mut HashSet<u32>
     }
 }
 
-/// system: PC の音を録る / apps: 空でなければ、そのアプリ（exe 名）の音だけを録る
-pub fn run(enc: Arc<Mutex<Encoder>>, t0: i64, system: bool, apps: Vec<String>, mic: Option<String>, stop: Arc<AtomicBool>) {
+/// system: PC の音を録る / apps: 空でなければ、そのアプリ（exe 名）の音だけを録る。
+/// 混ぜた音は out(PCM, 先頭からの位置) に渡す
+pub fn run(mut out: impl FnMut(&[i16], u64), t0: i64, system: bool, apps: Vec<String>, mic: Option<String>, stop: Arc<AtomicBool>) {
     unsafe { let _ = CoInitializeEx(None, COINIT_MULTITHREADED); }
+    let _mm = crate::recorder::MmThread::new("Pro Audio");
     let freq = qpf();
     let t0_hns = (t0 as i128 * 10_000_000 / freq as i128) as i64;
     let mut inputs = Vec::new();
@@ -353,9 +355,7 @@ pub fn run(enc: Arc<Mutex<Encoder>>, t0: i64, system: bool, apps: Vec<String>, m
             }
             pcm.clear();
             pcm.extend(mix.iter().map(|s| (s.clamp(-1.0, 1.0) * 32767.0) as i16));
-            if let Err(e) = enc.lock().unwrap().write_audio(&pcm, pos as u64) {
-                log(&format!("audio write: {e}"));
-            }
+            out(&pcm, pos as u64);
             pos = target;
         }
         if stopping {
