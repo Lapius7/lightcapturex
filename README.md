@@ -1,24 +1,41 @@
 <div align="center">
 
-# LightCaptureX
+<p align="center">
+  <img src="docs/images/banner.png" alt="LightCaptureX" width="100%">
+</p>
 
-An ultra-lightweight game recorder for Windows.
+<p align="center"><b>English</b> | <a href="README.ja.md">日本語</a></p>
 
-[![Release](https://img.shields.io/github/v/release/Lapius7/lightcapturex?style=flat-square&color=e5484d)](https://github.com/Lapius7/lightcapturex/releases/latest)
-[![License](https://img.shields.io/github/license/Lapius7/lightcapturex?style=flat-square)](LICENSE)
-![Windows](https://img.shields.io/badge/Windows-10%20%7C%2011-3b3e44?style=flat-square)
+<h1 align="center">LightCaptureX</h1>
 
-**English** · [日本語](README.ja.md)
+<h3 align="center">An ultra-lightweight game recorder for Windows.</h3>
 
-<img src="docs/screenshots/idle.png" width="640" alt="Main screen">
+<p align="center">A single ~0.7 MB executable with no runtime dependencies. Capture, color conversion, scaling and encoding all run on the GPU, so it barely touches the CPU. That helps with CPU-bound games such as VALORANT.</p>
 
-<img src="docs/screenshots/live.png" width="316" alt="Live stats while recording"> <img src="docs/screenshots/settings.png" width="316" alt="Settings">
+<p align="center">
+  <a href="https://github.com/Lapius7/lightcapturex/releases/latest"><img alt="Release" src="https://img.shields.io/github/v/release/Lapius7/lightcapturex?style=flat-square&color=e8833a&logo=github"></a>
+  <img alt="Windows" src="https://img.shields.io/badge/Windows-10%20%7C%2011-0078d4?style=flat-square&logo=windows&logoColor=white">
+  <a href="https://www.rust-lang.org"><img alt="Rust" src="https://img.shields.io/badge/Rust-dea584?style=flat-square&logo=rust&logoColor=black"></a>
+  <a href="LICENSE"><img alt="License" src="https://img.shields.io/github/license/Lapius7/lightcapturex?style=flat-square&color=97ca00"></a>
+  <a href="https://github.com/Lapius7/lightcapturex/stargazers"><img alt="Stars" src="https://img.shields.io/github/stars/Lapius7/lightcapturex?style=flat-square&color=e3b341&logo=github"></a>
+  <a href="https://github.com/Lapius7/lightcapturex/commits/main"><img alt="Last commit" src="https://img.shields.io/github/last-commit/Lapius7/lightcapturex?style=flat-square&color=3b82f6"></a>
+</p>
+
+<p align="center">
+  <a href="#features">Features</a> ·
+  <a href="#download">Download</a> ·
+  <a href="#usage">Usage</a> ·
+  <a href="#build">Build</a>
+</p>
+
+<p align="center">
+  <img src="docs/screenshots/live.png" width="49%" alt="Live stats while recording">
+  <img src="docs/screenshots/settings.png" width="49%" alt="Settings">
+</p>
 
 </div>
 
-A single ~0.7 MB executable with no runtime dependencies.
-
-Capture, color conversion, scaling and encoding all run on the GPU, so it barely touches the CPU — useful for CPU-bound games such as VALORANT.
+---
 
 ## Features
 

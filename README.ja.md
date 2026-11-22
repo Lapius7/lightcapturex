@@ -1,24 +1,41 @@
 <div align="center">
 
-# LightCaptureX
+<p align="center">
+  <img src="docs/images/banner.png" alt="LightCaptureX" width="100%">
+</p>
 
-Windows 用の超軽量なゲーム録画ソフト。
+<p align="center"><a href="README.md">English</a> | <b>日本語</b></p>
 
-[![Release](https://img.shields.io/github/v/release/Lapius7/lightcapturex?style=flat-square&color=e5484d)](https://github.com/Lapius7/lightcapturex/releases/latest)
-[![License](https://img.shields.io/github/license/Lapius7/lightcapturex?style=flat-square)](LICENSE)
-![Windows](https://img.shields.io/badge/Windows-10%20%7C%2011-3b3e44?style=flat-square)
+<h1 align="center">LightCaptureX</h1>
 
-[English](README.md) · **日本語**
+<h3 align="center">Windows 用の超軽量なゲーム録画ソフト。</h3>
 
-<img src="docs/screenshots/idle.png" width="640" alt="メイン画面">
+<p align="center">約 0.7 MB の exe ひとつで動き、ランタイムのインストールはいりません。画面の取り込み、色の変換、縮小、エンコードをすべて GPU で行うので、CPU はほとんど使いません。VALORANT のように CPU が重いゲームの録画に向いています。</p>
 
-<img src="docs/screenshots/live.png" width="316" alt="録画中のリアルタイム表示"> <img src="docs/screenshots/settings.png" width="316" alt="設定">
+<p align="center">
+  <a href="https://github.com/Lapius7/lightcapturex/releases/latest"><img alt="Release" src="https://img.shields.io/github/v/release/Lapius7/lightcapturex?style=flat-square&color=e8833a&logo=github"></a>
+  <img alt="Windows" src="https://img.shields.io/badge/Windows-10%20%7C%2011-0078d4?style=flat-square&logo=windows&logoColor=white">
+  <a href="https://www.rust-lang.org"><img alt="Rust" src="https://img.shields.io/badge/Rust-dea584?style=flat-square&logo=rust&logoColor=black"></a>
+  <a href="LICENSE"><img alt="License" src="https://img.shields.io/github/license/Lapius7/lightcapturex?style=flat-square&color=97ca00"></a>
+  <a href="https://github.com/Lapius7/lightcapturex/stargazers"><img alt="Stars" src="https://img.shields.io/github/stars/Lapius7/lightcapturex?style=flat-square&color=e3b341&logo=github"></a>
+  <a href="https://github.com/Lapius7/lightcapturex/commits/main"><img alt="Last commit" src="https://img.shields.io/github/last-commit/Lapius7/lightcapturex?style=flat-square&color=3b82f6"></a>
+</p>
+
+<p align="center">
+  <a href="#機能">機能</a> ·
+  <a href="#ダウンロード">ダウンロード</a> ·
+  <a href="#使い方">使い方</a> ·
+  <a href="#ビルド">ビルド</a>
+</p>
+
+<p align="center">
+  <img src="docs/screenshots/live.png" width="49%" alt="Live stats while recording">
+  <img src="docs/screenshots/settings.png" width="49%" alt="Settings">
+</p>
 
 </div>
 
-約 0.7 MB の exe ひとつで動き、ランタイムのインストールはいりません。
-
-画面の取り込み、色の変換、縮小、エンコードをすべて GPU で行うので、CPU はほとんど使いません。VALORANT のように CPU が重いゲームの録画に向いています。
+---
 
 ## 機能
 
